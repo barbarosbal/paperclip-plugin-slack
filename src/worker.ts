@@ -1,5 +1,4 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
   definePlugin,
@@ -114,8 +113,6 @@ let pluginToken: string;
 let pluginConfig: SlackConfig;
 const outsideInvocation = AsyncLocalStorage.snapshot();
 let socketModeClient: SlackSocketModeClient | null = null;
-let warnedMissingPaperclipApiKey = false;
-let cachedLocalEnv: Record<string, string> | null = null;
 let slackSigningSecret: string | null = null;
 
 /**
@@ -419,12 +416,9 @@ async function bootstrapRuntime(
   socketModeClient?.stop();
   socketModeClient = null;
   const appRef = normalizeSecretRef(config.slackAppTokenRef);
-  const inlineAppToken = config.slackAppToken?.trim() || process.env.SLACK_APP_TOKEN?.trim() || "";
-  if (appRef || inlineAppToken) {
+  if (appRef) {
     try {
-      const appToken = appRef
-        ? await ctx.secrets.resolve(appRef as unknown as string, { companyId, configPath: "slackAppTokenRef" })
-        : inlineAppToken;
+      const appToken = await ctx.secrets.resolve(appRef as unknown as string, { companyId, configPath: "slackAppTokenRef" });
       const client = new SlackSocketModeClient(ctx, appToken,
         createSocketModeHandlers(createSharedSlackTransportHandlers()));
       socketModeClient = client;
@@ -443,6 +437,8 @@ async function bootstrapRuntime(
       });
     }
   }
+
+  if (config.notifyOnRequestConfirmationCreated === true) await resolvePaperclipApiKey(ctx, config, companyId);
 
   ctx.logger.info("Slack plugin runtime bootstrapped from delivered configuration", { companyId });
   return rt;
@@ -530,33 +526,6 @@ function statusBadge(status: string): string {
 
 function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function readLocalEnvValue(name: string): string {
-  if (!cachedLocalEnv) {
-    cachedLocalEnv = {};
-    try {
-      const text = readFileSync(new URL("../.env", import.meta.url), "utf8");
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const idx = trimmed.indexOf("=");
-        if (idx <= 0) continue;
-        const key = trimmed.slice(0, idx).trim();
-        let value = trimmed.slice(idx + 1).trim();
-        if (
-          (value.startsWith("\"") && value.endsWith("\"")) ||
-          (value.startsWith("'") && value.endsWith("'"))
-        ) {
-          value = value.slice(1, -1);
-        }
-        cachedLocalEnv[key] = value;
-      }
-    } catch {
-      // Optional local fallback only.
-    }
-  }
-  return cachedLocalEnv[name] ?? "";
 }
 
 async function readInteractionSlackMessage(companyId: string, interactionId: string): Promise<InteractionSlackMessageState | null> {
@@ -840,27 +809,23 @@ type InteractionSlackMessageState = {
   status: string;
 };
 
-async function resolvePaperclipApiKey(ctx: PluginContext, config: SlackConfig): Promise<string> {
-  const inline = config.paperclipApiKey?.trim() ?? "";
-  if (inline) return inline;
-
-  const env = process.env.PAPERCLIP_API_KEY?.trim() ?? "";
-  if (env) return env;
-
-  const localEnv = readLocalEnvValue("PAPERCLIP_API_KEY").trim();
-  if (localEnv) return localEnv;
-
+async function resolvePaperclipApiKey(ctx: PluginContext, config: SlackConfig, companyId = runtime?.companyId): Promise<string> {
   const ref = normalizeSecretRef(config.paperclipApiKeyRef);
-  if (!ref) return "";
-
-  try {
-    return await ctx.secrets.resolve(ref as unknown as string, { companyId: runtime!.companyId, configPath: "paperclipApiKeyRef" });
-  } catch (err) {
-    ctx.logger.warn("Unable to resolve Paperclip API key secret ref", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return "";
+  if (ref && companyId) {
+    try {
+      const key = await ctx.secrets.resolve(ref as unknown as string, { companyId, configPath: "paperclipApiKeyRef" });
+      if (key) return key;
+    } catch (err) {
+      ctx.logger.warn("Unable to resolve Paperclip API key secret reference", {
+        error: redactSecretRefs(String(err), config.paperclipApiKeyRef), companyId,
+      });
+    }
   }
+  if (config.notifyOnRequestConfirmationCreated === true) {
+    degradeHealth("Issue-thread confirmations are enabled but paperclipApiKeyRef is missing or could not be resolved. Configure a Paperclip API key secret reference.",
+      "slack-confirmation-api-key-unresolved", { companyId });
+  }
+  return "";
 }
 
 async function fetchPaperclipApi(
@@ -963,16 +928,10 @@ async function syncIssueInteractions(
   config: SlackConfig,
   companyId: string,
 ): Promise<void> {
-  if (config.notifyOnRequestConfirmationCreated === false) return;
+  if (config.notifyOnRequestConfirmationCreated !== true) return;
 
   const apiKey = await resolvePaperclipApiKey(ctx, config);
-  if (!apiKey) {
-    if (!warnedMissingPaperclipApiKey) {
-      warnedMissingPaperclipApiKey = true;
-      ctx.logger.warn("Paperclip API key not configured; issue-thread confirmation Slack sync disabled");
-    }
-    return;
-  }
+  if (!apiKey) return;
 
   const channelId = config.approvalsChannelId || config.defaultChannelId;
   if (!channelId) return;

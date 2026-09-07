@@ -665,7 +665,7 @@ describe("Socket Mode invocation lifetime", () => {
       } });
       await vi.waitFor(() => expect(seen).toEqual([{ invocation: undefined, companyId: COMPANY_A }]));
       expect(host.ctx.companies.list).not.toHaveBeenCalled();
-      await host.deliver(COMPANY_B, storedConfig({ slackAppToken: "test-other" }));
+      await host.deliver(COMPANY_B, storedConfig({ slackAppTokenRef: { type: "secret_ref", secretId: SECRET_ID } }));
       expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
       expect(host.ctx.secrets.resolve).toHaveBeenCalledWith(
         { type: "secret_ref", secretId: SECRET_ID },
@@ -692,7 +692,7 @@ describe("company-scoped confirmation deduplication", () => {
     host.ctx.http.fetch.mockResolvedValue({ ok: true, json: async () => ({ ok: true, ts: "123.456" }) });
     try {
       await definition().setup(host.ctx);
-      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKey: "fixture-only", notifyOnRequestConfirmationCreated: true }));
+      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKeyRef: { type: "secret_ref", secretId: SECRET_ID }, notifyOnRequestConfirmationCreated: true }));
       const job = jobs.get("check-issue-interactions")!;
       await job();
       await job();
@@ -728,7 +728,7 @@ describe("authoritative confirmation input validation", () => {
     host.ctx.http.fetch.mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
     try {
       await definition().setup(host.ctx);
-      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKey: "fixture-only" }));
+      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKeyRef: { type: "secret_ref", secretId: SECRET_ID } }));
       const parsedBody = { type: "block_actions", response_url: "https://hooks.slack.test/response", actions: [{ action_id: actionId, value: JSON.stringify({ issueId: "issue-1", interactionId: "interaction-1" }) }] };
       const rawBody = JSON.stringify(parsedBody);
       const timestamp = String(Math.floor(Date.now() / 1000));
@@ -737,5 +737,41 @@ describe("authoritative confirmation input validation", () => {
       expect(requests).toEqual(canMutate ? ["GET", "POST"] : ["GET"]);
       expect(JSON.stringify(host.ctx.http.fetch.mock.calls)).toContain("interaction_view_issue");
     } finally { vi.unstubAllGlobals(); }
+  });
+});
+
+describe("confirmation credential health", () => {
+  it("keeps optional confirmations disabled and healthy by default", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    expect(_getRuntimeForTests()?.config.notifyOnRequestConfirmationCreated).toBe(false);
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+    expect(host.ctx.secrets.resolve.mock.calls.some((call: any[]) => call[1]?.configPath === "paperclipApiKeyRef")).toBe(false);
+  });
+
+  it.each(["missing", "unresolved"])("degrades enabled confirmations with %s API credentials", async (mode) => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "paperclipApiKeyRef") throw new Error("fixture resolver unavailable");
+      return options.configPath === "slackSigningSecretRef" ? "signing-secret" : "xoxb-token";
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true,
+      ...(mode === "unresolved" ? { paperclipApiKeyRef: SECRET_ID } : {}),
+    }));
+    expect(await definition().onHealth()).toMatchObject({ status: "degraded",
+      details: { issue: "slack-confirmation-api-key-unresolved", companyId: COMPANY_A } });
+    expect((await definition().onHealth()).message).toContain("paperclipApiKeyRef");
+  });
+
+  it("normalizes the API reference for the owner and recovers on a valid save", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true }));
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+    expect(host.ctx.secrets.resolve).toHaveBeenCalledWith({ type: "secret_ref", secretId: SECRET_ID },
+      { companyId: COMPANY_A, configPath: "paperclipApiKeyRef" });
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
   });
 });

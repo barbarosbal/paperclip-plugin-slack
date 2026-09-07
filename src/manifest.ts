@@ -64,12 +64,6 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Secret UUID for your Slack app-level xapp token with connections:write. Optional; when empty, webhook mode remains active.",
         default: DEFAULT_CONFIG.slackAppTokenRef,
       },
-      slackAppToken: {
-        type: "string",
-        title: "Slack App-Level Token (inline fallback)",
-        description: "Local/backward-compatible fallback for Socket Mode when plugin secret refs are unavailable. Prefer slackAppTokenRef.",
-        default: DEFAULT_CONFIG.slackAppToken,
-      },
       slackSigningSecretRef: {
         type: ["string", "object"],
         format: "secret-ref",
@@ -81,14 +75,8 @@ const manifest: PaperclipPluginManifestV1 = {
         type: ["string", "object"],
         format: "secret-ref",
         title: "Paperclip API Key (secret reference)",
-        description: "Secret UUID for a Paperclip API key that can resolve issue-thread confirmations from Slack. Optional when PAPERCLIP_API_KEY is available locally.",
+        description: "Secret UUID for a Paperclip API key that can resolve issue-thread confirmations from Slack. Required when issue-thread confirmation notifications are enabled.",
         default: DEFAULT_CONFIG.paperclipApiKeyRef,
-      },
-      paperclipApiKey: {
-        type: "string",
-        title: "Paperclip API Key (inline fallback)",
-        description: "Local/backward-compatible fallback for issue-thread confirmation actions. Prefer PAPERCLIP_API_KEY or paperclipApiKeyRef.",
-        default: DEFAULT_CONFIG.paperclipApiKey,
       },
       defaultChannelId: {
         type: "string",

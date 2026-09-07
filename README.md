@@ -175,7 +175,7 @@ If the plugin looks broken, first confirm which Paperclip host it's actually tal
 |---------|-------------|
 | `slackTokenRef` | Secret reference for the Slack Bot OAuth token |
 | `slackAppTokenRef` | Optional secret reference for the Slack app-level `xapp-...` token used by Socket Mode |
-| `paperclipApiKeyRef` | Optional secret reference for a Paperclip API key used to resolve issue-thread confirmations |
+| `paperclipApiKeyRef` | Secret reference for a Paperclip API key; required when enabling issue-thread confirmations |
 | `defaultChannelId` | Default Slack channel ID (e.g. `C01ABC2DEF3`) |
 | `approvalsChannelId` | Dedicated channel for approvals (optional) |
 | `errorsChannelId` | Dedicated channel for agent errors (optional) |
@@ -183,7 +183,7 @@ If the plugin looks broken, first confirm which Paperclip host it's actually tal
 | `notifyOnIssueCreated` | Post when issues are created (default: true) |
 | `notifyOnIssueDone` | Post when issues are completed (default: true) |
 | `notifyOnApprovalCreated` | Post when approvals are requested (default: true) |
-| `notifyOnRequestConfirmationCreated` | Post pending issue-thread confirmations (default: true) |
+| `notifyOnRequestConfirmationCreated` | Post pending issue-thread confirmations (default: false; requires `paperclipApiKeyRef`) |
 | `notifyOnAgentError` | Post when agent runs fail (default: true) |
 | `notifyOnAgentConnected` | Post when agents connect/disconnect (default: true) |
 | `notifyOnBudgetThreshold` | Post when agents hit budget limits (default: true) |
@@ -229,7 +229,7 @@ npm run build
 
 129 tests covering notifications, approvals, escalation, session registry, media pipeline, custom commands, proactive suggestions, Block Kit formatting, Socket Mode, and slash commands.
 
-For full local verification, run `npm run verify`. When `SLACK_APP_TOKEN` is available, run `npm run smoke:socket` to verify that Slack returns a Socket Mode WebSocket URL.
+For full local verification, run `npm run verify`. For the standalone diagnostic script only, set `SLACK_APP_TOKEN` and run `npm run smoke:socket` to verify that Slack returns a Socket Mode WebSocket URL. Installed plugin workers use `slackAppTokenRef` and `paperclipApiKeyRef`; they do not read host environment credentials or package `.env` files.
 
 ## Contributing
 
