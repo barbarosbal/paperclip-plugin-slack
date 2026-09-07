@@ -70,7 +70,7 @@ export function isRequestConfirmationInteraction(
 }
 
 export function encodeInteractionActionValue(value: InteractionActionValue): string {
-  return JSON.stringify(value);
+  return JSON.stringify({ issueId: value.issueId, interactionId: value.interactionId });
 }
 
 export function decodeInteractionActionValue(value: string): InteractionActionValue | null {

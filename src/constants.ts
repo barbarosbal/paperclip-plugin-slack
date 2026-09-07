@@ -38,14 +38,11 @@ export const STATE_KEYS = {
 
 export const DEFAULT_CONFIG = {
   slackTokenRef: "",
-  slackToken: "",
   slackAppTokenRef: "",
   slackAppToken: "",
   slackSigningSecretRef: "",
-  slackSigningSecret: "",
   paperclipApiKeyRef: "",
   paperclipApiKey: "",
-  companyId: "",
   defaultChannelId: "",
   approvalsChannelId: "",
   errorsChannelId: "",

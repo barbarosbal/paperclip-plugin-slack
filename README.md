@@ -133,9 +133,9 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
   -d '{"packageName":"paperclip-plugin-slack"}'
 ```
 
-> [!WARNING]
-> **`paperclipai` master, post [#5429](https://github.com/paperclipai/paperclip/pull/5429) (2026-05-09):**
-> The new Secrets Manager ships with a temporary kill switch on plugin secret-ref UUIDs while a company-scoped `plugin_config` follow-up lands. If you're running paperclipai master, plugin activation will fail with `Plugin secret references are disabled until company-scoped plugin config lands`, and `POST /api/plugins/:id/config` returns HTTP 422 for configs containing secret-ref UUIDs (e.g. `slackTokenRef`). This is intentional fail-closed mitigation (PAP-2394 — see the [upstream plan doc](https://github.com/paperclipai/paperclip/blob/master/doc/plans/2026-04-26-plugin-secret-ref-company-scope.md)). Until the follow-up lands, pin to the last paperclipai release before #5429. This callout will be removed once secret-ref resolution is restored.
+> [!NOTE]
+> **Company-scoped activation ([#9557](https://github.com/paperclipai/paperclip/pull/9557), first stable in `v2026.720.0`):**
+> the host now resolves plugin secret references under a company scope. This plugin is **deliveries-only**: it reads no configuration and resolves no secrets at startup, and builds its runtime from the host's company-scoped configuration delivery (`onConfigChanged`). On **`v2026.817.0`+** it activates out of the box; on **`v2026.720.0` / `722.0`** save the plugin configuration once through the settings panel after installing, to trigger the first delivery. The earlier temporary secret-ref kill switch ([#5429](https://github.com/paperclipai/paperclip/pull/5429)) was removed upstream in #9557 — no host pinning is needed any more.
 
 ## Troubleshooting: confirm your Paperclip host
 
@@ -167,7 +167,7 @@ If the plugin looks broken, first confirm which Paperclip host it's actually tal
    - **REST API:** `POST /api/companies/{companyId}/secrets` with body `{"name": "slack-bot-oauth-token", "value": "<your-bot-oauth-token>", "provider": "local_encrypted"}`. The response contains the secret's UUID.
 
    Copy the resulting secret UUID — you'll paste it into `slackTokenRef` in the next step.
-7. Install the plugin and configure the Bot token secret UUID in `slackTokenRef`, the app-level token secret UUID in `slackAppTokenRef` when using Socket Mode, and your default channel ID. Leave `slackAppTokenRef` empty to keep webhook mode only.
+7. Install the plugin and configure the Bot token secret UUID in `slackTokenRef`, the app-level token secret UUID in `slackAppTokenRef` when using Socket Mode, the signing secret reference in `slackSigningSecretRef`, and your default channel ID. The host-delivered company owns all inbound commands and confirmation state. Leave `slackAppTokenRef` empty to keep webhook mode only.
 
 ## Configuration
 
@@ -176,7 +176,6 @@ If the plugin looks broken, first confirm which Paperclip host it's actually tal
 | `slackTokenRef` | Secret reference for the Slack Bot OAuth token |
 | `slackAppTokenRef` | Optional secret reference for the Slack app-level `xapp-...` token used by Socket Mode |
 | `paperclipApiKeyRef` | Optional secret reference for a Paperclip API key used to resolve issue-thread confirmations |
-| `companyId` | Optional company UUID for local Socket Mode instances where company scope cannot be inferred |
 | `defaultChannelId` | Default Slack channel ID (e.g. `C01ABC2DEF3`) |
 | `approvalsChannelId` | Dedicated channel for approvals (optional) |
 | `errorsChannelId` | Dedicated channel for agent errors (optional) |

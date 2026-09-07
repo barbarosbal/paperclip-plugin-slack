@@ -76,12 +76,13 @@ describe("request confirmation action values", () => {
       interactionId: interaction.id,
     });
 
+    expect(value.length).toBeLessThan(2000);
     expect(decodeInteractionActionValue(value)).toEqual({
-      issueId: issue.id,
-      issueIdentifier: issue.identifier,
-      issueTitle: issue.title,
-      interactionId: interaction.id,
+      issueId: issue.id, interactionId: interaction.id,
+      issueIdentifier: undefined, issueTitle: undefined,
     });
+    expect(encodeInteractionActionValue({ issueId: issue.id, interactionId: interaction.id,
+      issueTitle: "long title".repeat(2000) })).toBe(value);
   });
 
   it("rejects invalid action payloads", () => {

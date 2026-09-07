@@ -105,17 +105,20 @@ export class SlackSocketModeClient {
       this.ws = ws;
 
       ws.addEventListener("open", () => {
+        if (this.stopped || this.ws !== ws) return;
         this.scheduleHealthyConnectionReset();
         this.ctx.logger.info("Socket Mode connected");
         this.writeMetric("slack.socket.connected");
       });
 
       ws.addEventListener("message", (event) => {
+        if (this.stopped || this.ws !== ws) return;
         const raw = this.coerceMessageData(event.data);
         if (raw) this.handleMessage(ws, raw);
       });
 
       ws.addEventListener("close", (event) => {
+        if (this.stopped || this.ws !== ws) return;
         if (this.ws === ws) this.ws = null;
         this.clearHealthyConnectionTimer();
         this.ctx.logger.info("Socket Mode disconnected", {
@@ -126,6 +129,7 @@ export class SlackSocketModeClient {
       });
 
       ws.addEventListener("error", () => {
+        if (this.stopped || this.ws !== ws) return;
         if (this.ws === ws) this.ws = null;
         this.clearHealthyConnectionTimer();
         this.ctx.logger.warn("Socket Mode WebSocket error");
@@ -178,6 +182,7 @@ export class SlackSocketModeClient {
   }
 
   private handleMessage(ws: WebSocket, raw: string): void {
+    if (this.stopped || this.ws !== ws) return;
     let envelope: SocketModeEnvelope;
     try {
       envelope = JSON.parse(raw) as SocketModeEnvelope;

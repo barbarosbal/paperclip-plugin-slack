@@ -1,13 +1,12 @@
+import type { SecretRef } from "./secret-ref-validation.js";
+
 export type SlackConfig = {
-  slackTokenRef: string;
-  slackToken?: string;
-  slackAppTokenRef: string;
+  slackTokenRef: SecretRef;
+  slackAppTokenRef: SecretRef;
   slackAppToken?: string;
-  slackSigningSecretRef: string;
-  slackSigningSecret?: string;
-  paperclipApiKeyRef: string;
+  slackSigningSecretRef: SecretRef;
+  paperclipApiKeyRef: SecretRef;
   paperclipApiKey?: string;
-  companyId?: string;
   defaultChannelId: string;
   approvalsChannelId: string;
   errorsChannelId: string;

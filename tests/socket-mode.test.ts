@@ -276,3 +276,35 @@ describe("SlackSocketModeClient", () => {
     client.stop();
   });
 });
+
+describe("retired Socket Mode callbacks", () => {
+  it("ignores envelopes and lifecycle events from stopped and replaced sockets", async () => {
+    vi.useFakeTimers();
+    MockWebSocket.instances = [];
+    const ctx = makeCtx();
+    const handlers = makeHandlers();
+    const client = makeClient(ctx, handlers);
+    try {
+      await client.start();
+      const old = MockWebSocket.instances[0];
+      client.stop();
+      old.fireMessage({ envelope_id: "stopped", type: "events_api", payload: {} });
+      expect(handlers.onEventCallback).not.toHaveBeenCalled();
+      expect(old.sent).toEqual([]);
+      await client.start();
+      const current = MockWebSocket.instances[1];
+      current.fire("open");
+      old.fire("open");
+      old.fire("close", { code: 1006 });
+      old.fire("error");
+      old.fireMessage({ envelope_id: "old", type: "events_api", payload: {} });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(ctx.http.fetch).toHaveBeenCalledTimes(2);
+      expect(handlers.onEventCallback).not.toHaveBeenCalled();
+      expect(current.closeCount).toBe(0);
+      current.fireMessage({ envelope_id: "new", type: "events_api", payload: { event: "live" } });
+      expect(handlers.onEventCallback).toHaveBeenCalledWith({ event: "live" });
+      expect(old.sent).toEqual([]);
+    } finally { client.stop(); vi.useRealTimers(); }
+  });
+});

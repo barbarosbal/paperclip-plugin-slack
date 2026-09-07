@@ -44,22 +44,21 @@ const manifest: PaperclipPluginManifestV1 = {
   },
   instanceConfigSchema: {
     type: "object",
+    additionalProperties: true,
     properties: {
       slackTokenRef: {
-        type: "string",
+        // string | object: older hosts persist a bare secret UUID string,
+        // current hosts bind an object `{ type: "secret_ref", secretId, version? }`
+        // and reject the bare string. Declaring only "string" makes the two
+        // mutually unsatisfiable, so the plugin becomes unconfigurable on one.
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Bot Token (secret reference)",
         description: "Secret UUID for your Slack Bot OAuth token. Create the secret in Settings → Secrets, then paste its UUID here.",
         default: DEFAULT_CONFIG.slackTokenRef,
       },
-      slackToken: {
-        type: "string",
-        title: "Slack Bot Token (inline fallback)",
-        description: "Local/backward-compatible fallback for instances that cannot resolve plugin secret refs. Prefer slackTokenRef.",
-        default: DEFAULT_CONFIG.slackToken,
-      },
       slackAppTokenRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack App-Level Token (secret reference)",
         description: "Secret UUID for your Slack app-level xapp token with connections:write. Optional; when empty, webhook mode remains active.",
@@ -72,20 +71,14 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.slackAppToken,
       },
       slackSigningSecretRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Signing Secret (secret reference)",
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",
         default: DEFAULT_CONFIG.slackSigningSecretRef,
       },
-      slackSigningSecret: {
-        type: "string",
-        title: "Slack Signing Secret (inline fallback)",
-        description: "Local/backward-compatible fallback for webhook signature verification. Prefer slackSigningSecretRef.",
-        default: DEFAULT_CONFIG.slackSigningSecret,
-      },
       paperclipApiKeyRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Paperclip API Key (secret reference)",
         description: "Secret UUID for a Paperclip API key that can resolve issue-thread confirmations from Slack. Optional when PAPERCLIP_API_KEY is available locally.",
@@ -96,12 +89,6 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Paperclip API Key (inline fallback)",
         description: "Local/backward-compatible fallback for issue-thread confirmation actions. Prefer PAPERCLIP_API_KEY or paperclipApiKeyRef.",
         default: DEFAULT_CONFIG.paperclipApiKey,
-      },
-      companyId: {
-        type: "string",
-        title: "Paperclip Company ID",
-        description: "Company UUID to use for Slack inbound commands/events. Set this for local Socket Mode instances where worker invocation scope cannot list companies.",
-        default: DEFAULT_CONFIG.companyId,
       },
       defaultChannelId: {
         type: "string",
@@ -206,7 +193,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.maxAgentsPerThread,
       },
     },
-    required: ["defaultChannelId"],
+    required: ["slackTokenRef", "slackSigningSecretRef", "defaultChannelId"],
   },
   jobs: [
     {
