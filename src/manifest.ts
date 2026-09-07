@@ -44,16 +44,21 @@ const manifest: PaperclipPluginManifestV1 = {
   },
   instanceConfigSchema: {
     type: "object",
+    additionalProperties: true,
     properties: {
       slackTokenRef: {
-        type: "string",
+        // string | object: older hosts persist a bare secret UUID string,
+        // current hosts bind an object `{ type: "secret_ref", secretId, version? }`
+        // and reject the bare string. Declaring only "string" makes the two
+        // mutually unsatisfiable, so the plugin becomes unconfigurable on one.
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Bot Token (secret reference)",
         description: "Secret UUID for your Slack Bot OAuth token. Create the secret in Settings → Secrets, then paste its UUID here.",
         default: DEFAULT_CONFIG.slackTokenRef,
       },
       slackSigningSecretRef: {
-        type: "string",
+        type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Signing Secret (secret reference)",
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",

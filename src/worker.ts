@@ -7,11 +7,10 @@ import {
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
 } from "@paperclipai/plugin-sdk";
-import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID } from "./constants.js";
+import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
 import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
-import { SlackAdapter } from "./adapter.js";
 import {
   spawnAgent,
   closeAgent,
@@ -51,23 +50,363 @@ import {
   checkWatches,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
-import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
+import { resolveStartupSlackToken, SECRET_RESOLUTION_ISSUE_URL, type SlackRuntimeHealth } from "./runtime-token.js";
+import {
+  isUsableSecretRef,
+  normalizeSecretRef,
+  normalizeSecretRefId,
+  redactSecretRefs,
+  validateSecretRefFields,
+} from "./secret-ref-validation.js";
 
+// =========================================================================
+// Runtime state — deliveries-only company scoping
+//
+// setup() runs OUTSIDE any company scope. Since paperclipai/paperclip#9557 the
+// SDK's governed gate requires a company scope for `config.get()` and
+// `secrets.resolve()`; an unscoped call in setup() throws "company context is
+// required" and kills activation (issue #31). So setup() only registers
+// handlers, and `onConfigChanged` is the ONLY thing that builds/refreshes the
+// runtime — resolving secrets under the company the host attributed the
+// delivery to. Handlers no-op until a delivery has built the runtime.
+// =========================================================================
+
+/** Everything a company-scoped invocation needs, built from a config delivery. */
+type SlackRuntime = {
+  companyId: string;
+  config: SlackConfig;
+  token: string;
+  signingSecret: string | null;
+  baseUrl: string;
+};
+
+/** Captured in setup() so onWebhook / onConfigChanged can reach the host APIs. */
 let pluginCtx: PluginContext;
+/** The active runtime, or null until the first configuration delivery. */
+let runtime: SlackRuntime | null = null;
+let runtimeHealth: SlackRuntimeHealth = {
+  status: "degraded",
+  message: "Waiting for company-scoped configuration from the host",
+  details: {
+    issue: "slack-awaiting-company-config",
+    reference: SECRET_RESOLUTION_ISSUE_URL,
+  },
+};
+
+// Legacy convenience mirrors, written only by bootstrapRuntime. Module-level
+// handlers (slash commands, interactivity) read these AFTER an ensureRuntime()
+// guard upstream has confirmed the runtime exists.
 let pluginToken: string;
 let pluginConfig: SlackConfig;
-let slackAdapter: SlackAdapter;
-let runtimeHealth: SlackRuntimeHealth = { status: "ok" };
+let slackSigningSecret: string | null = null;
+
+/**
+ * The single ordered critical section every configuration delivery runs inside.
+ * Host->worker requests are NOT serialized by the transport, so two deliveries
+ * must queue against each other here.
+ */
+let bootstrapQueue: Promise<void> = Promise.resolve();
+/** The company this worker serves, once one has been selected. */
+let ownerCompanyId: string | null = null;
+/** Config last accepted for the owner, for the host's equal-config rule. */
+let ownerConfigJson: string | null = null;
+/** Companies already refused; keeps a chatty non-owner from flooding the log. */
+const refusedCompanies = new Set<string>();
+
+function setRuntimeHealth(health: SlackRuntimeHealth): void {
+  runtimeHealth = health;
+}
+
+function degradeHealth(message: string, issue: string, details?: Record<string, unknown>): void {
+  runtimeHealth = {
+    status: "degraded",
+    message,
+    details: { issue, reference: SECRET_RESOLUTION_ISSUE_URL, ...details },
+  };
+}
+
+/** Test seam — reset all module-level runtime state. */
+export function _resetRuntimeForTests(): void {
+  runtime = null;
+  bootstrapQueue = Promise.resolve();
+  ownerCompanyId = null;
+  ownerConfigJson = null;
+  refusedCompanies.clear();
+  pluginToken = undefined as unknown as string;
+  pluginConfig = undefined as unknown as SlackConfig;
+  slackSigningSecret = null;
+  runtimeHealth = {
+    status: "degraded",
+    message: "Waiting for company-scoped configuration from the host",
+    details: {
+      issue: "slack-awaiting-company-config",
+      reference: SECRET_RESOLUTION_ISSUE_URL,
+    },
+  };
+}
+
+/** Current runtime, or null when the plugin has not been bootstrapped yet. */
+export function _getRuntimeForTests(): SlackRuntime | null {
+  return runtime;
+}
+
+/**
+ * The runtime for a company-scoped invocation, or null.
+ *
+ * Never reads config and never bootstraps: configuration deliveries are the
+ * ONLY way a runtime starts. A company that is not the owner gets null, logged
+ * once. Callers MUST treat null as "do nothing for this company".
+ */
+function ensureRuntime(companyId?: string | null): SlackRuntime | null {
+  if (companyId && ownerCompanyId && companyId !== ownerCompanyId) {
+    if (pluginCtx && !refusedCompanies.has(companyId)) {
+      refusedCompanies.add(companyId);
+      pluginCtx.logger.warn(
+        `Slack plugin ignoring an invocation for company ${companyId}; this install serves ${ownerCompanyId}`,
+        { runningCompanyId: ownerCompanyId, invokingCompanyId: companyId },
+      );
+    }
+    return null;
+  }
+  if (!runtime) return null;
+  if (companyId && companyId !== runtime.companyId) return null;
+  return runtime;
+}
+
+function stableConfigJson(config: unknown): string {
+  const normalize = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([key, entry]) => [key, normalize(entry)]),
+      );
+    }
+    return value;
+  };
+  return JSON.stringify(normalize(config));
+}
+
+/**
+ * The single ownership gate. The first company whose configuration reaches this
+ * worker claims it; claiming does not require the runtime to start, so an owner
+ * whose token stopped resolving stays the owner. One exception, mirroring the
+ * host's single-tenant guard: an identical configuration under a DIFFERENT
+ * company advances ownership (migration duplicates each unbound legacy config
+ * across every company), else the plugin would own A while the SDK owns B.
+ */
+function claimOwnership(ctx: PluginContext, companyId: string, config: unknown): boolean {
+  const configJson = stableConfigJson(config);
+
+  if (!ownerCompanyId) {
+    ownerCompanyId = companyId;
+    ownerConfigJson = configJson;
+    return true;
+  }
+  if (ownerCompanyId === companyId) {
+    ownerConfigJson = configJson;
+    return true;
+  }
+  if (ownerConfigJson !== null && ownerConfigJson === configJson) {
+    ctx.logger.info(
+      `Slack plugin owner advancing from company ${ownerCompanyId} to ${companyId}: identical configuration, ` +
+        "matching the host's single-tenant rule",
+      { previousCompanyId: ownerCompanyId, companyId },
+    );
+    // Retire the outgoing owner's runtime FIRST. Everything after can fail (the
+    // new owner may have no resolvable token), and a live runtime bound to a
+    // company that no longer owns the install is worse than none: a no-arg
+    // ensureRuntime() during the bootstrap window would otherwise still serve it.
+    runtime = null;
+    ownerCompanyId = companyId;
+    ownerConfigJson = configJson;
+    refusedCompanies.delete(companyId);
+    return true;
+  }
+  if (!refusedCompanies.has(companyId)) {
+    refusedCompanies.add(companyId);
+    ctx.logger.warn(
+      `Slack plugin ignoring configuration for company ${companyId}; this install serves ${ownerCompanyId}`,
+      { runningCompanyId: ownerCompanyId, deliveredCompanyId: companyId },
+    );
+  }
+  return false;
+}
+
+async function readScopedConfig(
+  ctx: PluginContext,
+  companyId: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const rawConfig = await ctx.config.get(companyId);
+    return (rawConfig as Record<string, unknown>) ?? null;
+  } catch (err) {
+    ctx.logger.debug("Company-scoped plugin config is not readable", {
+      companyId,
+      error: String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Identify which company a context-less config delivery belongs to.
+ *
+ * The v2026.720/722 SDKs call onConfigChanged(config) with no scope, but the
+ * host still binds the invocation to the real company and denies a read for any
+ * other one, so probing each company here identifies the delivered scope: only
+ * the right company answers.
+ */
+async function identifyDeliveredCompany(
+  ctx: PluginContext,
+  deliveredConfig: unknown,
+): Promise<string | null> {
+  let companies: Array<{ id: string }>;
+  try {
+    companies = await ctx.companies.list();
+  } catch (err) {
+    ctx.logger.info("Could not list companies while attributing a configuration delivery", {
+      error: String(err),
+    });
+    return null;
+  }
+
+  const readable: Array<{ id: string; config: Record<string, unknown> }> = [];
+  for (const company of companies) {
+    const config = await readScopedConfig(ctx, company.id);
+    if (config) readable.push({ id: company.id, config });
+  }
+
+  if (readable.length === 0) return null;
+  if (readable.length === 1) return readable[0].id;
+
+  // A host that answers for several companies (>= 2026.817.0) is not telling us
+  // which one was saved; match the delivered secret reference against the rows.
+  const deliveredSecretId = normalizeSecretRefId(
+    (deliveredConfig as Record<string, unknown> | null)?.slackTokenRef,
+  );
+  if (deliveredSecretId) {
+    const match = readable.find(
+      (row) => normalizeSecretRefId(row.config.slackTokenRef) === deliveredSecretId,
+    );
+    if (match) return match.id;
+  }
+  return readable[0].id;
+}
+
+/**
+ * Run one bootstrap attempt inside the ordered critical section shared by every
+ * configuration delivery — the only thing that bootstraps.
+ */
+function queueBootstrap<T>(work: () => Promise<T>): Promise<T> {
+  const next = bootstrapQueue.then(work, work);
+  bootstrapQueue = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
+/**
+ * Apply one company's stored configuration to the runtime. Callers MUST go
+ * through queueBootstrap. Never throws: every failure path degrades health and
+ * returns null.
+ */
+async function bootstrapRuntime(
+  ctx: PluginContext,
+  companyId: string,
+  rawConfig: unknown,
+): Promise<SlackRuntime | null> {
+  if (!claimOwnership(ctx, companyId, rawConfig)) return runtime;
+
+  // A failed (re-)bootstrap leaves any EXISTING runtime intact: an owner whose
+  // new save has a broken token keeps serving on the old one, degraded-but-live,
+  // until a valid save arrives. On a fresh install `runtime` is already null.
+  const config = {
+    ...DEFAULT_CONFIG,
+    ...(rawConfig as Record<string, unknown>),
+  } as unknown as SlackConfig;
+
+  // Required config is reported through health, never thrown: throwing here
+  // would kill worker activation on a host that simply has not delivered a
+  // usable config yet. onValidateConfig is what fails a bad save loudly.
+  if (!isUsableSecretRef(config.slackTokenRef)) {
+    degradeHealth(
+      `[${PLUGIN_ID}] slackTokenRef is missing or not a Paperclip secret UUID; set the Slack bot token in plugin settings`,
+      "slack-bot-token-missing",
+      { companyId },
+    );
+    ctx.logger.warn("Slack plugin config has no resolvable bot token reference", { companyId });
+    return null;
+  }
+
+  const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, setRuntimeHealth, companyId);
+  if (!token) {
+    ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved", { companyId });
+    return null;
+  }
+
+  // Signing secret is required for inbound webhook verification. Normalize a
+  // legacy bare-UUID ref before resolving (the token path does the same) — a
+  // current host rejects a raw string ref outright (F4). onWebhook fails closed
+  // until it resolves.
+  let signingSecret: string | null = null;
+  if (isUsableSecretRef(config.slackSigningSecretRef)) {
+    try {
+      const signingRef = normalizeSecretRef(config.slackSigningSecretRef) ?? config.slackSigningSecretRef;
+      signingSecret = await ctx.secrets.resolve(signingRef as string, {
+        companyId,
+        configPath: "slackSigningSecretRef",
+      });
+    } catch (err) {
+      ctx.logger.warn("Slack signing secret could not be resolved — inbound webhook verification is disabled", {
+        error: redactSecretRefs(String(err), config.slackSigningSecretRef),
+        companyId,
+      });
+    }
+  }
+
+  const rt: SlackRuntime = {
+    companyId,
+    config,
+    token,
+    signingSecret,
+    baseUrl: config.paperclipBaseUrl || "http://localhost:3100",
+  };
+
+  // Publish as one coherent snapshot, THEN apply the formatter-global side
+  // effect and update the legacy mirrors the module-level handlers read. Doing
+  // setBaseUrl only here keeps a failed refresh from mutating global state the
+  // retained old runtime would be inconsistent with (F6).
+  runtime = rt;
+  if (config.paperclipBaseUrl) setBaseUrl(config.paperclipBaseUrl);
+  pluginToken = token;
+  pluginConfig = config;
+  slackSigningSecret = signingSecret;
+
+  if (!signingSecret) {
+    // Outbound works, but every inbound webhook fails closed without the signing
+    // secret. Report that honestly instead of leaving health "ok" (F4).
+    degradeHealth(
+      "Slack bot token resolved, but the signing secret is unavailable — inbound webhooks " +
+        "(events, slash commands, interactivity) are rejected until it resolves.",
+      "slack-signing-secret-unresolved",
+      { companyId },
+    );
+  }
+
+  ctx.logger.info("Slack plugin runtime bootstrapped from delivered configuration", { companyId });
+  return rt;
+}
 
 // --- Slack signature verification ---
-
-let slackSigningSecret: string | null = null;
 
 function verifySlackSignature(
   headers: Record<string, string | string[]>,
   rawBody: string,
 ): boolean {
-  if (!slackSigningSecret) return true; // skip if not configured
+  if (!slackSigningSecret) return false; // fail closed: cannot verify without the signing secret
 
   const timestamp = String(
     headers["x-slack-request-timestamp"] ??
@@ -147,14 +486,11 @@ function genId(prefix: string): string {
 
 // --- Slash command routing ---
 
-async function handleSlashCommand(ctx: PluginContext, rawBody: string): Promise<void> {
+async function handleSlashCommand(ctx: PluginContext, rawBody: string, companyId: string): Promise<void> {
   const { text, responseUrl, channelId, threadTs } = parseSlashCommand(rawBody);
   const parts = text.trim().split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? "";
   const arg = parts[1]?.toLowerCase() ?? "";
-
-  const companies = await ctx.companies.list({ limit: 1, offset: 0 });
-  const companyId = companies[0]?.id ?? "";
 
   try {
     switch (subcommand) {
@@ -386,43 +722,13 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
 
 const plugin = definePlugin({
   async setup(ctx) {
-    const rawConfig = await ctx.config.get();
-    const config = rawConfig as unknown as SlackConfig;
-    // Always reads the current persisted config so flag changes (e.g.
-    // toggling notifyOnAgentConnected) take effect without restarting the
-    // plugin worker.
-    const getConfig = async (): Promise<SlackConfig> =>
-      (await ctx.config.get()) as unknown as SlackConfig;
-
     pluginCtx = ctx;
-    pluginConfig = config;
 
-    if (config.paperclipBaseUrl) {
-      setBaseUrl(config.paperclipBaseUrl);
-    }
-
-    if (!config.slackTokenRef) {
-      ctx.logger.warn("No slackTokenRef configured, notifications disabled");
-      return;
-    }
-
-    const token = await resolveStartupSlackToken(ctx, config.slackTokenRef, (health) => {
-      runtimeHealth = health;
-    });
-    if (!token) {
-      ctx.logger.warn("Slack plugin runtime disabled because Slack token could not be resolved");
-      return;
-    }
-    pluginToken = token;
-
-    // Resolve Slack signing secret for webhook signature verification
-    if (config.slackSigningSecretRef) {
-      try {
-        slackSigningSecret = await ctx.secrets.resolve(config.slackSigningSecretRef);
-      } catch {
-        ctx.logger.warn("Slack signing secret not configured — webhook signature verification disabled");
-      }
-    }
+    // Handlers are registered unconditionally and synchronously — the SDK
+    // requires every registration to complete within setup(). The company-
+    // scoped config that used to gate them is unreadable here (it arrives only
+    // via onConfigChanged), so each handler starts with ensureRuntime() and
+    // no-ops until a configuration delivery has built the runtime.
 
     // =========================================================================
     // PHASE 1: Escalation - using 3-arg ctx.tools.register with ToolRunContext
@@ -459,6 +765,8 @@ const plugin = definePlugin({
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
         const companyId = runCtx.companyId;
+        const rt = ensureRuntime(companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const escalationId = genId("esc");
 
         const record: EscalationRecord = {
@@ -473,13 +781,13 @@ const plugin = definePlugin({
           createdAt: new Date().toISOString(),
         };
 
-        const channelId = config.escalationChatId || config.approvalsChannelId || config.defaultChannelId;
+        const channelId = rt.config.escalationChatId || rt.config.approvalsChannelId || rt.config.defaultChannelId;
         if (!channelId) {
           return { error: "No escalation channel configured" };
         }
 
         const message = formatEscalationMessage(record);
-        const result = await postMessage(ctx, token, channelId, message);
+        const result = await postMessage(ctx, rt.token, channelId, message);
 
         if (result.ok && result.ts) {
           await ctx.state.set(
@@ -503,8 +811,8 @@ const plugin = definePlugin({
           await ctx.metrics.write("slack.escalations.created", 1);
         }
 
-        if (config.escalationHoldMessage) {
-          return { content: JSON.stringify({ escalationId, holdMessage: config.escalationHoldMessage }) };
+        if (rt.config.escalationHoldMessage) {
+          return { content: JSON.stringify({ escalationId, holdMessage: rt.config.escalationHoldMessage }) };
         }
         return { content: JSON.stringify({ escalationId }) };
       },
@@ -535,6 +843,8 @@ const plugin = definePlugin({
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
         const companyId = runCtx.companyId;
+        const rt = ensureRuntime(companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const fromAgent = String(p.fromAgent ?? "");
         const toAgent = String(p.toAgent ?? "");
         const reason = String(p.reason ?? "");
@@ -561,7 +871,7 @@ const plugin = definePlugin({
         );
 
         const blocks = buildHandoffBlocks(fromAgent, toAgent, reason, handoffId);
-        await postMessage(ctx, token, channelId, {
+        await postMessage(ctx, rt.token, channelId, {
           text: `Handoff: ${fromAgent} -> ${toAgent}: ${reason}`,
           blocks,
         }, threadTs ? { threadTs } : undefined);
@@ -591,7 +901,9 @@ const plugin = definePlugin({
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
         const companyId = runCtx.companyId;
-        const result = await startDiscussion(ctx, token, companyId, {
+        const rt = ensureRuntime(companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
+        const result = await startDiscussion(ctx, rt.token, companyId, {
           initiatorAgent: String(p.initiatorAgent ?? ""),
           targetAgent: String(p.targetAgent ?? ""),
           topic: String(p.topic ?? ""),
@@ -625,9 +937,11 @@ const plugin = definePlugin({
       },
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const result = await processMediaFile(
           ctx,
-          token,
+          rt.token,
           runCtx.companyId,
           String(p.fileId),
           String(p.channelId),
@@ -683,6 +997,8 @@ const plugin = definePlugin({
       },
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const command: CommandDefinition = {
           name: String(p.name),
           description: String(p.description),
@@ -724,6 +1040,8 @@ const plugin = definePlugin({
       },
       async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const watch = await registerWatch(ctx, runCtx.companyId, {
           channelId: String(p.channelId),
           threadTs: String(p.threadTs ?? ""),
@@ -750,9 +1068,11 @@ const plugin = definePlugin({
           required: ["watchId"],
         },
       },
-      async (params: unknown, _runCtx) => {
+      async (params: unknown, runCtx) => {
         const p = params as Record<string, unknown>;
-        const removed = await removeWatch(ctx, String(p.watchId));
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
+        const removed = await removeWatch(ctx, String(p.watchId), runCtx.companyId);
         return { content: JSON.stringify({ removed, watchId: String(p.watchId) }) };
       },
     );
@@ -767,7 +1087,9 @@ const plugin = definePlugin({
           properties: {},
         },
       },
-      async (_params, _runCtx) => {
+      async (_params, runCtx) => {
+        const rt = ensureRuntime(runCtx.companyId);
+        if (!rt) return { error: "Slack plugin is not configured yet" };
         const templates = BUILTIN_WATCH_TEMPLATES.map((t) => ({
           name: t.name,
           eventPattern: t.eventPattern,
@@ -787,10 +1109,12 @@ const plugin = definePlugin({
       overrideChannelId?: string,
       opts?: { threadTs?: string },
     ) => {
-      const fallback = overrideChannelId || config.defaultChannelId;
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const fallback = overrideChannelId || rt.config.defaultChannelId;
       const channelId = await resolveChannel(ctx, event.companyId, fallback);
       if (!channelId) return;
-      const result = await postMessage(ctx, token, channelId, formatter(event), opts);
+      const result = await postMessage(ctx, rt.token, channelId, formatter(event), opts);
       if (result.ok) {
         await ctx.activity.log({
           companyId: event.companyId,
@@ -812,7 +1136,9 @@ const plugin = definePlugin({
     // Handlers are always registered so that config changes (e.g. toggling
     // notifyOnAgentConnected) take effect without a plugin restart.
     ctx.events.on("issue.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnIssueCreated) return;
       const result = await notify(event, formatIssueCreated);
       if (result?.ok && result.ts) {
@@ -824,7 +1150,9 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("issue.updated", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnIssueDone) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status !== "done") return;
@@ -837,19 +1165,25 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("approval.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnApprovalCreated) return;
       await notify(event, formatApprovalCreated, live.approvalsChannelId);
     });
 
     ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnAgentError) return;
       await notify(event, formatAgentError, live.errorsChannelId);
     });
 
     ctx.events.on("agent.status_changed", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnAgentConnected) return;
       const payload = event.payload as Record<string, unknown>;
       if (payload.status === "active" || payload.status === "online") {
@@ -858,7 +1192,9 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnAgentConnected) return;
       const payload = event.payload as Record<string, unknown>;
       // Dedup on agent id, not run id — event.entityId is the run UUID for
@@ -888,7 +1224,9 @@ const plugin = definePlugin({
     });
 
     ctx.events.on("cost_event.created", async (event: PluginEvent) => {
-      const live = await getConfig();
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
+      const live = rt.config;
       if (!live.notifyOnBudgetThreshold) return;
       const payload = event.payload as Record<string, unknown>;
       const pct = Number(payload.percentUsed ?? 0);
@@ -922,7 +1260,7 @@ const plugin = definePlugin({
         scopeId: companyId,
         stateKey: STATE_KEYS.slackChannel,
       });
-      return { channelId: saved ?? config.defaultChannelId };
+      return { channelId: saved ?? ensureRuntime(companyId)?.config.defaultChannelId ?? "" };
     });
 
     ctx.actions.register("set-channel", async (params) => {
@@ -940,12 +1278,19 @@ const plugin = definePlugin({
     // Jobs
     // =========================================================================
 
-    // Daily digest
-    if (config.enableDailyDigest) {
+    // Daily digest — always registered; the enableDailyDigest flag is checked
+    // inside each handler against the delivered runtime config, because config
+    // is not readable at setup time under company scoping.
+    {
       ctx.jobs.register("daily-digest", async () => {
-        const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+        const rt = ensureRuntime();
+        if (!rt || !rt.config.enableDailyDigest) return;
+        // Single-tenant: this worker serves only its owner. Iterating every
+        // visible company would read their data and post it with the OWNER's
+        // token/config (F2). Operate strictly on rt.companyId.
+        const companies = [{ id: rt.companyId }];
         for (const company of companies) {
-          const channelId = await resolveChannel(ctx, company.id, config.defaultChannelId);
+          const channelId = await resolveChannel(ctx, company.id, rt.config.defaultChannelId);
           if (!channelId) continue;
 
           const issues = await ctx.issues.list({ companyId: company.id, limit: 200, offset: 0 });
@@ -988,7 +1333,7 @@ const plugin = definePlugin({
             }
           }
 
-          await postMessage(ctx, token, channelId, formatDailyDigest({
+          await postMessage(ctx, rt.token, channelId, formatDailyDigest({
             tasksCompleted,
             tasksCreated,
             agentsActive,
@@ -1015,6 +1360,8 @@ const plugin = definePlugin({
 
       // Accumulate costs
       ctx.events.on("cost_event.created", async (event: PluginEvent) => {
+        const rt = ensureRuntime(event.companyId);
+        if (!rt || !rt.config.enableDailyDigest) return;
         const payload = event.payload as Record<string, unknown>;
         const cost = Number(payload.cost ?? 0);
         if (cost <= 0) return;
@@ -1049,8 +1396,13 @@ const plugin = definePlugin({
 
     // Escalation timeout job
     ctx.jobs.register("check-escalation-timeouts", async () => {
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
-      const timeoutMs = config.escalationTimeoutMs ?? 900000;
+      const rt = ensureRuntime();
+      if (!rt) return;
+      // Single-tenant: this worker serves only its owner. Iterating every
+      // visible company would read their data and post it with the OWNER's
+      // token/config (F2). Operate strictly on rt.companyId.
+      const companies = [{ id: rt.companyId }];
+      const timeoutMs = rt.config.escalationTimeoutMs ?? 900000;
       const now = Date.now();
 
       for (const company of companies) {
@@ -1073,7 +1425,7 @@ const plugin = definePlugin({
           if (now - createdAt < timeoutMs) continue;
 
           const escalationId = String(record.id);
-          const defaultAction = config.escalationDefaultAction ?? "defer";
+          const defaultAction = rt.config.escalationDefaultAction ?? "defer";
 
           await ctx.state.set(
             { scopeKind: "company", scopeId: company.id, stateKey: STATE_KEYS.escalationRecord(escalationId) },
@@ -1093,7 +1445,7 @@ const plugin = definePlugin({
           }) as string | null;
 
           if (channelId && threadTs) {
-            await postMessage(ctx, token, channelId, {
+            await postMessage(ctx, rt.token, channelId, {
               text: `Escalation timed out - default action: ${defaultAction}`,
               blocks: [
                 {
@@ -1115,7 +1467,12 @@ const plugin = definePlugin({
 
     // Phase 5: Check watches job
     ctx.jobs.register("check-watches", async () => {
-      const companies = await ctx.companies.list({ limit: 100, offset: 0 });
+      const rt = ensureRuntime();
+      if (!rt) return;
+      // Single-tenant: this worker serves only its owner. Iterating every
+      // visible company would read their data and post it with the OWNER's
+      // token/config (F2). Operate strictly on rt.companyId.
+      const companies = [{ id: rt.companyId }];
       for (const company of companies) {
         // Get recent events from state (populated by event listeners below)
         const recentEventsRaw = await ctx.state.get({
@@ -1128,7 +1485,7 @@ const plugin = definePlugin({
           : [];
 
         if (recentEvents.length > 0) {
-          await checkWatches(ctx, token, company.id, recentEvents);
+          await checkWatches(ctx, rt.token, company.id, recentEvents);
           // Clear after processing
           await ctx.state.set(
             { scopeKind: "company", scopeId: company.id, stateKey: "recent-watch-events" },
@@ -1144,8 +1501,10 @@ const plugin = definePlugin({
 
     // Native agent streaming output
     ctx.events.on("plugin.slack.agent-stream-chunk", async (event: PluginEvent) => {
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      await handleAgentOutput(ctx, rt.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),
@@ -1157,8 +1516,10 @@ const plugin = definePlugin({
 
     // ACP output events (from cross-plugin)
     ctx.events.on(`plugin.paperclip-plugin-acp.output`, async (event: PluginEvent) => {
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
       const p = event.payload as Record<string, unknown>;
-      await handleAgentOutput(ctx, token, event.companyId, {
+      await handleAgentOutput(ctx, rt.token, event.companyId, {
         channel: String(p.channel ?? ""),
         threadTs: String(p.threadTs ?? ""),
         text: String(p.text ?? ""),
@@ -1170,6 +1531,7 @@ const plugin = definePlugin({
 
     // Escalation thread reply routing (from Slack Events API)
     ctx.events.on("plugin.slack.thread_reply_escalation", async (event: PluginEvent) => {
+      if (!ensureRuntime(event.companyId)) return;
       const p = event.payload as Record<string, unknown>;
       const escalationId = String(p.escalationId ?? "");
       const replyText = String(p.text ?? "");
@@ -1218,6 +1580,8 @@ const plugin = definePlugin({
 
     // Thread message routing (multi-agent + custom commands + media)
     ctx.events.on("plugin.slack.thread_message", async (event: PluginEvent) => {
+      const rt = ensureRuntime(event.companyId);
+      if (!rt) return;
       const p = event.payload as Record<string, unknown>;
       const channel = String(p.channel ?? "");
       const threadTs = String(p.threadTs ?? "");
@@ -1231,13 +1595,13 @@ const plugin = definePlugin({
         const fileId = String(file.id ?? "");
         const mimetype = String(file.mimetype ?? "");
         if (fileId && isMediaFile(mimetype)) {
-          await processMediaFile(ctx, token, event.companyId, fileId, channel, threadTs);
+          await processMediaFile(ctx, rt.token, event.companyId, fileId, channel, threadTs);
         }
       }
 
       // Phase 4: Check for custom commands
       if (text) {
-        const handled = await tryCustomCommand(ctx, token, event.companyId, channel, threadTs, text);
+        const handled = await tryCustomCommand(ctx, rt.token, event.companyId, channel, threadTs, text);
         if (handled) return;
       }
 
@@ -1255,6 +1619,7 @@ const plugin = definePlugin({
     ];
     for (const eventType of watchableEvents) {
       ctx.events.on(eventType, async (event: PluginEvent) => {
+        if (!ensureRuntime(event.companyId)) return;
         const recentEventsRaw = await ctx.state.get({
           scopeKind: "company",
           scopeId: event.companyId,
@@ -1280,9 +1645,66 @@ const plugin = definePlugin({
       });
     }
 
-    slackAdapter = new SlackAdapter(ctx, token);
+    ctx.logger.info("Slack Chat OS plugin handlers registered; waiting for delivered configuration");
+  },
 
-    ctx.logger.info("Slack Chat OS plugin started");
+  /**
+   * The host delivers stored config here — at worker startup and on every save —
+   * and, from SDK v2026.817.0, with its company scope. Before then the config
+   * arrives with no scope; probe for the delivered company inside this
+   * invocation (only the delivered company answers a scoped config read).
+   */
+  async onConfigChanged(newConfig, context): Promise<void> {
+    const ctx = pluginCtx;
+    if (!ctx) return;
+
+    await queueBootstrap(async () => {
+      let companyId = context?.companyId ?? null;
+      if (!companyId) {
+        const running = runtime;
+        if (running) {
+          // Do NOT assume a context-less delivery belongs to the running
+          // company: probe it, and if it does not answer this delivery belongs
+          // to somebody else — leave the running company untouched.
+          const ownConfig = await readScopedConfig(ctx, running.companyId);
+          if (ownConfig) {
+            companyId = running.companyId;
+          } else {
+            const other = await identifyDeliveredCompany(ctx, newConfig);
+            ctx.logger.warn(
+              other
+                ? `Slack plugin ignoring configuration for company ${other}; this install serves ${running.companyId}`
+                : `Slack plugin ignoring a configuration delivery it could not attribute; this install serves ${running.companyId}`,
+              { runningCompanyId: running.companyId, deliveredCompanyId: other },
+            );
+            return;
+          }
+        } else {
+          companyId = await identifyDeliveredCompany(ctx, newConfig);
+        }
+
+        if (companyId) {
+          ctx.logger.info("Config delivered without a company scope; identified it by scoped probe", { companyId });
+        }
+      }
+
+      if (!companyId) {
+        degradeHealth(
+          "Configuration was delivered without a company scope and no company answered a scoped " +
+            "configuration read, so its secrets cannot be resolved. Upgrade the host to v2026.817.0 or newer.",
+          "slack-config-scope-unknown",
+        );
+        return;
+      }
+
+      try {
+        await bootstrapRuntime(ctx, companyId, newConfig);
+      } catch (err) {
+        const error = String(err);
+        ctx.logger.error("Slack plugin failed to apply a configuration change", { error, companyId });
+        degradeHealth(`Applying the delivered configuration failed: ${error}`, "slack-config-apply-failed", { companyId });
+      }
+    });
   },
 
   // =========================================================================
@@ -1292,7 +1714,21 @@ const plugin = definePlugin({
   async onWebhook(input: PluginWebhookInput): Promise<void> {
     // Verify Slack request signature (skip for url_verification challenge)
     const body = input.parsedBody as Record<string, unknown> | undefined;
-    const isVerificationChallenge = body?.type === "url_verification";
+    // Scope the signature exemption to a url_verification body on the Events
+    // endpoint ONLY. Otherwise an attacker sends a slash-command / interactivity
+    // request whose parsed body carries type=url_verification and skips
+    // signature verification entirely (F1).
+    const isVerificationChallenge =
+      input.endpointKey === WEBHOOK_KEYS.slackEvents && body?.type === "url_verification";
+
+    const rt = ensureRuntime();
+    if (!rt) {
+      // Not bootstrapped: no signing secret to verify with and no token to act
+      // on. Only the Slack URL-verification handshake needs no runtime.
+      if (isVerificationChallenge) return;
+      pluginCtx.logger.warn("Rejecting webhook: Slack plugin is not configured yet");
+      return;
+    }
 
     if (!isVerificationChallenge && !verifySlackSignature(input.headers, input.rawBody)) {
       pluginCtx.logger.warn("Rejected webhook: invalid Slack signature");
@@ -1309,13 +1745,12 @@ const plugin = definePlugin({
       if (body?.type === "event_callback") {
         const event = body.event as Record<string, unknown> | undefined;
         if (event?.type === "file_shared") {
-          const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-          const companyId = companies[0]?.id ?? "";
+          const companyId = rt.companyId;
           const fileId = String(event.file_id ?? "");
           const channelId = String(event.channel_id ?? "");
 
           if (fileId && channelId) {
-            await processMediaFile(pluginCtx, pluginToken, companyId, fileId, channelId, "");
+            await processMediaFile(pluginCtx, rt.token, companyId, fileId, channelId, "");
           }
         }
       }
@@ -1323,7 +1758,7 @@ const plugin = definePlugin({
 
     // Slash commands
     if (input.endpointKey === WEBHOOK_KEYS.slashCommand) {
-      await handleSlashCommand(pluginCtx, input.rawBody);
+      await handleSlashCommand(pluginCtx, input.rawBody, rt.companyId);
       return;
     }
 
@@ -1347,8 +1782,7 @@ const plugin = definePlugin({
 
       if (!actionValue) return;
 
-      const companies = await pluginCtx.companies.list({ limit: 1, offset: 0 });
-      const companyId = companies[0]?.id ?? "";
+      const companyId = rt.companyId;
 
       // --- Approval buttons ---
       if (actionId === "approval_approve" || actionId === "approval_reject") {
@@ -1486,13 +1920,15 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (!config.slackTokenRef || typeof config.slackTokenRef !== "string") {
-      return { ok: false, errors: ["slackTokenRef is required"] };
+    const errors = validateSecretRefFields(config as { slackTokenRef?: unknown; slackSigningSecretRef?: unknown });
+    if (
+      !config.defaultChannelId ||
+      typeof config.defaultChannelId !== "string" ||
+      config.defaultChannelId.trim().length === 0
+    ) {
+      errors.push("defaultChannelId is required.");
     }
-    if (!config.defaultChannelId || typeof config.defaultChannelId !== "string") {
-      return { ok: false, errors: ["defaultChannelId is required"] };
-    }
-    return { ok: true };
+    return errors.length > 0 ? { ok: false, errors } : { ok: true };
   },
 
   async onHealth(): Promise<PluginHealthDiagnostics> {

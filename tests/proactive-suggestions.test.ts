@@ -1,6 +1,56 @@
-import { describe, it, expect } from "vitest";
-import { BUILTIN_WATCH_TEMPLATES } from "../src/proactive-suggestions.js";
+import { describe, it, expect, vi } from "vitest";
+import type { PluginContext } from "@paperclipai/plugin-sdk";
+import {
+  BUILTIN_WATCH_TEMPLATES,
+  registerWatch,
+  removeWatch,
+  listWatches,
+} from "../src/proactive-suggestions.js";
 import { isMediaFile, isAudioFile } from "../src/media-pipeline.js";
+
+function stateCtx(): PluginContext {
+  const store = new Map<string, unknown>();
+  const key = (k: any) => `${k.scopeKind}:${k.scopeId ?? ""}:${k.stateKey}`;
+  return {
+    state: {
+      get: vi.fn(async (k: any) => store.get(key(k)) ?? null),
+      set: vi.fn(async (k: any, v: unknown) => { store.set(key(k), v); }),
+    },
+    logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  } as unknown as PluginContext;
+}
+
+const COMPANY_A = "11111111-1111-1111-1111-111111111111";
+const COMPANY_B = "22222222-2222-2222-2222-222222222222";
+
+describe("watch registry tenancy (F3)", () => {
+  it("does not let one company delete another company's watch by id", async () => {
+    const ctx = stateCtx();
+    const watchA = await registerWatch(ctx, COMPANY_A, {
+      companyId: COMPANY_A, channelId: "C1", threadTs: "", eventPattern: "issue.created",
+      agentId: "agent", prompt: "p", createdBy: "tool",
+    });
+
+    // Company B tries to remove company A's watch by its id.
+    const removed = await removeWatch(ctx, watchA.id, COMPANY_B);
+
+    expect(removed).toBe(false);
+    expect(await listWatches(ctx, COMPANY_A)).toHaveLength(1);
+  });
+
+  it("lets the owning company delete its own watch", async () => {
+    const ctx = stateCtx();
+    const watchA = await registerWatch(ctx, COMPANY_A, {
+      companyId: COMPANY_A, channelId: "C1", threadTs: "", eventPattern: "issue.created",
+      agentId: "agent", prompt: "p", createdBy: "tool",
+    });
+
+    const removed = await removeWatch(ctx, watchA.id, COMPANY_A);
+
+    expect(removed).toBe(true);
+    expect(await listWatches(ctx, COMPANY_A)).toHaveLength(0);
+  });
+});
 
 describe("BUILTIN_WATCH_TEMPLATES", () => {
   it("has 5 built-in templates", () => {

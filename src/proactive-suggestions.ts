@@ -45,9 +45,14 @@ export async function registerWatch(
   return entry;
 }
 
-export async function removeWatch(ctx: PluginContext, watchId: string): Promise<boolean> {
+export async function removeWatch(ctx: PluginContext, watchId: string, companyId?: string): Promise<boolean> {
   const watches = await getAllWatches(ctx);
-  const filtered = watches.filter((w) => w.id !== watchId);
+  // The registry is instance-global, so a delete must be scoped to the caller's
+  // company: only remove the watch when the id matches AND (when a company is
+  // supplied) it belongs to that company. Prevents one tenant deleting another's.
+  const filtered = watches.filter(
+    (w) => !(w.id === watchId && (companyId === undefined || w.companyId === companyId)),
+  );
   if (filtered.length === watches.length) return false;
   await setAllWatches(ctx, filtered);
   return true;

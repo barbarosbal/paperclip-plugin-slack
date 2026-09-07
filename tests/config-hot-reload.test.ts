@@ -7,9 +7,12 @@ import { describe, it, expect, beforeEach } from "vitest";
 // with `if (config.notifyOnAgentConnected)`. Toggling the flag in the UI had
 // no effect until the worker restarted.
 //
-// The fix: handlers are always registered; each handler calls ctx.config.get()
-// at invocation time. These tests replicate that pattern and verify that
-// disabling a flag mid-flight silences subsequent events.
+// The fix: handlers are always registered and each reads the live config at
+// invocation time. Under company scoping that live config is the runtime the
+// host rebuilds on every `onConfigChanged` delivery (a saved flag change is
+// re-delivered), rather than a per-invocation ctx.config.get(). These tests
+// replicate the read-live-each-time pattern and verify that disabling a flag
+// mid-flight silences subsequent events.
 // ---------------------------------------------------------------------------
 
 type Config = {
