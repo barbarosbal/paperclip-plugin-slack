@@ -1,4 +1,6 @@
 export type SecretRefConfig = {
+  slackAppTokenRef?: unknown;
+  paperclipApiKeyRef?: unknown;
   slackTokenRef?: unknown;
   slackSigningSecretRef?: unknown;
 };
@@ -6,6 +8,8 @@ export type SecretRefConfig = {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const FIELDS = [
+  { key: "slackAppTokenRef", required: false },
+  { key: "paperclipApiKeyRef", required: false },
   { key: "slackTokenRef", required: true },
   { key: "slackSigningSecretRef", required: true },
 ] as const;

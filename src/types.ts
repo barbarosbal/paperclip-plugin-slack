@@ -1,6 +1,10 @@
+import type { SecretRef } from "./secret-ref-validation.js";
+
 export type SlackConfig = {
-  slackTokenRef: string;
-  slackSigningSecretRef: string;
+  slackTokenRef: SecretRef;
+  slackAppTokenRef: SecretRef;
+  slackSigningSecretRef: SecretRef;
+  paperclipApiKeyRef: SecretRef;
   defaultChannelId: string;
   approvalsChannelId: string;
   errorsChannelId: string;
@@ -9,6 +13,7 @@ export type SlackConfig = {
   notifyOnIssueCreated: boolean;
   notifyOnIssueDone: boolean;
   notifyOnApprovalCreated: boolean;
+  notifyOnRequestConfirmationCreated: boolean;
   notifyOnAgentError: boolean;
   notifyOnAgentConnected: boolean;
   notifyOnBudgetThreshold: boolean;

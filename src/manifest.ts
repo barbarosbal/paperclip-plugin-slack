@@ -57,12 +57,26 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Secret UUID for your Slack Bot OAuth token. Create the secret in Settings → Secrets, then paste its UUID here.",
         default: DEFAULT_CONFIG.slackTokenRef,
       },
+      slackAppTokenRef: {
+        type: ["string", "object"],
+        format: "secret-ref",
+        title: "Slack App-Level Token (secret reference)",
+        description: "Secret UUID for your Slack app-level xapp token with connections:write. Optional; when empty, webhook mode remains active.",
+        default: DEFAULT_CONFIG.slackAppTokenRef,
+      },
       slackSigningSecretRef: {
         type: ["string", "object"],
         format: "secret-ref",
         title: "Slack Signing Secret (secret reference)",
         description: "Secret UUID for your Slack app's Signing Secret. Required to verify that incoming webhooks are genuinely from Slack.",
         default: DEFAULT_CONFIG.slackSigningSecretRef,
+      },
+      paperclipApiKeyRef: {
+        type: ["string", "object"],
+        format: "secret-ref",
+        title: "Paperclip API Key (secret reference)",
+        description: "Secret UUID for a Paperclip API key that can resolve issue-thread confirmations from Slack. Required when issue-thread confirmation notifications are enabled.",
+        default: DEFAULT_CONFIG.paperclipApiKeyRef,
       },
       defaultChannelId: {
         type: "string",
@@ -102,6 +116,12 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         title: "Notify on approval requested",
         default: DEFAULT_CONFIG.notifyOnApprovalCreated,
+      },
+      notifyOnRequestConfirmationCreated: {
+        type: "boolean",
+        title: "Notify on issue-thread confirmations",
+        description: "Posts pending simple and checkbox confirmations. Buttons are available when no additional input is needed; choose options or provide required decline reasons in Paperclip. Requires paperclipApiKeyRef.",
+        default: DEFAULT_CONFIG.notifyOnRequestConfirmationCreated,
       },
       notifyOnAgentError: {
         type: "boolean",
@@ -174,6 +194,12 @@ const manifest: PaperclipPluginManifestV1 = {
       jobKey: "check-escalation-timeouts",
       displayName: "Check Escalation Timeouts",
       description: "Checks for unresolved escalations that have exceeded the configured timeout.",
+      schedule: "*/1 * * * *",
+    },
+    {
+      jobKey: "check-issue-interactions",
+      displayName: "Check Issue Confirmations",
+      description: "Posts pending Paperclip issue-thread confirmations to Slack and updates resolved cards.",
       schedule: "*/1 * * * *",
     },
     {

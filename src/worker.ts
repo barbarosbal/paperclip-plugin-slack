@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   definePlugin,
   runWorker,
@@ -6,11 +7,14 @@ import {
   type PluginEvent,
   type PluginWebhookInput,
   type PluginHealthDiagnostics,
+  type Issue,
 } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS, STATE_KEYS, PLUGIN_ID, DEFAULT_CONFIG } from "./constants.js";
-import { postMessage, respondToAction, respondEphemeral } from "./slack-api.js";
+import { postMessage, updateMessage, respondToAction, respondEphemeral } from "./slack-api.js";
 import type { SlackMessage } from "./slack-api.js";
 import type { SlackConfig, EscalationRecord, CommandDefinition, SessionEntry } from "./types.js";
+import { SlackSocketModeClient } from "./socket-mode.js";
+import { createSocketModeHandlers, dispatchSlackWebhook } from "./slack-transport.js";
 import {
   spawnAgent,
   closeAgent,
@@ -50,6 +54,15 @@ import {
   checkWatches,
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
+import {
+  INTERACTION_ACCEPT_ACTION_ID,
+  INTERACTION_REJECT_ACTION_ID,
+  decodeInteractionActionValue,
+  formatRequestConfirmationInteraction,
+  formatRequestConfirmationStatus,
+  isRequestConfirmationInteraction,
+  type RequestConfirmationInteraction,
+} from "./interactions.js";
 import { resolveStartupSlackToken, SECRET_RESOLUTION_ISSUE_URL, type SlackRuntimeHealth } from "./runtime-token.js";
 import {
   isUsableSecretRef,
@@ -98,6 +111,8 @@ let runtimeHealth: SlackRuntimeHealth = {
 // guard upstream has confirmed the runtime exists.
 let pluginToken: string;
 let pluginConfig: SlackConfig;
+const outsideInvocation = AsyncLocalStorage.snapshot();
+let socketModeClient: SlackSocketModeClient | null = null;
 let slackSigningSecret: string | null = null;
 
 /**
@@ -127,6 +142,8 @@ function degradeHealth(message: string, issue: string, details?: Record<string, 
 
 /** Test seam — reset all module-level runtime state. */
 export function _resetRuntimeForTests(): void {
+  socketModeClient?.stop();
+  socketModeClient = null;
   runtime = null;
   bootstrapQueue = Promise.resolve();
   ownerCompanyId = null;
@@ -396,6 +413,33 @@ async function bootstrapRuntime(
     );
   }
 
+  socketModeClient?.stop();
+  socketModeClient = null;
+  const appRef = normalizeSecretRef(config.slackAppTokenRef);
+  if (appRef) {
+    try {
+      const appToken = await ctx.secrets.resolve(appRef as unknown as string, { companyId, configPath: "slackAppTokenRef" });
+      const client = new SlackSocketModeClient(ctx, appToken,
+        createSocketModeHandlers(createSharedSlackTransportHandlers()));
+      socketModeClient = client;
+      // Socket callbacks and reconnect timers outlive this configuration delivery.
+      void outsideInvocation(() => client.start()).catch((err) => {
+        if (socketModeClient !== client) return;
+        degradeHealth("Slack Socket Mode failed to start", "slack-socket-start-failed", { companyId });
+        ctx.logger.warn("Slack Socket Mode failed to start", {
+          error: redactSecretRefs(String(err), config.slackAppTokenRef), companyId,
+        });
+      });
+    } catch (err) {
+      degradeHealth("Slack Socket Mode failed to start", "slack-socket-start-failed", { companyId });
+      ctx.logger.warn("Slack Socket Mode failed to start", {
+        error: redactSecretRefs(String(err), config.slackAppTokenRef), companyId,
+      });
+    }
+  }
+
+  if (config.notifyOnRequestConfirmationCreated === true) await resolvePaperclipApiKey(ctx, config, companyId);
+
   ctx.logger.info("Slack plugin runtime bootstrapped from delivered configuration", { companyId });
   return rt;
 }
@@ -484,6 +528,16 @@ function genId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+async function readInteractionSlackMessage(companyId: string, interactionId: string): Promise<InteractionSlackMessageState | null> {
+  return await pluginCtx.state.get({ scopeKind: "company", scopeId: companyId,
+    stateKey: STATE_KEYS.interactionSlackMessage(interactionId) }) as InteractionSlackMessageState | null;
+}
+
+async function writeInteractionSlackMessage(companyId: string, interactionId: string, value: InteractionSlackMessageState): Promise<void> {
+  await pluginCtx.state.set({ scopeKind: "company", scopeId: companyId,
+    stateKey: STATE_KEYS.interactionSlackMessage(interactionId) }, value);
+}
+
 // --- Slash command routing ---
 
 async function handleSlashCommand(ctx: PluginContext, rawBody: string, companyId: string): Promise<void> {
@@ -556,10 +610,15 @@ async function handleSlashCommand(ctx: PluginContext, rawBody: string, companyId
     }
     await ctx.metrics.write("slack.commands.handled", 1, { command_name: subcommand || "help" });
   } catch (err) {
-    ctx.logger.warn("Slash command failed", { subcommand, err });
-    await respondEphemeral(ctx, responseUrl, {
-      text: "Something went wrong processing your command. Please try again.",
+    ctx.logger.warn("Slash command failed", {
+      subcommand,
+      error: err instanceof Error ? err.message : String(err),
     });
+    if (responseUrl) {
+      await respondEphemeral(ctx, responseUrl, {
+        text: "Something went wrong processing your command. Please try again.",
+      });
+    }
   }
 }
 
@@ -715,6 +774,568 @@ async function handleApproveCommand(ctx: PluginContext, responseUrl: string, app
   } catch (err) {
     ctx.logger.warn("Approve command failed", { approvalId, err });
     await respondEphemeral(ctx, responseUrl, { text: `:x: Failed to approve \`${approvalId}\`. Check the ID and try again.` });
+  }
+}
+
+// --- Shared Slack inbound handlers (webhooks + Socket Mode) ---
+
+function createSharedSlackTransportHandlers() {
+  return {
+    handleEventsPayload: handleSlackEventsPayload,
+    handleSlashCommandBody: async (rawBody: string) => {
+      const rt = ensureRuntime();
+      if (rt) await handleSlashCommand(pluginCtx, rawBody, rt.companyId);
+    },
+    handleInteractivityPayload,
+  };
+}
+
+async function getDefaultCompanyId(_ctx: PluginContext): Promise<string> {
+  const rt = ensureRuntime();
+  if (!rt) throw new Error("Slack runtime has no delivered company");
+  return rt.companyId;
+}
+
+const INTERACTION_SCAN_STATUSES: Array<Issue["status"]> = [
+  "todo",
+  "in_progress",
+  "in_review",
+  "blocked",
+];
+
+type InteractionSlackMessageState = {
+  channelId: string;
+  ts: string;
+  status: string;
+};
+
+async function resolvePaperclipApiKey(ctx: PluginContext, config: SlackConfig, companyId = runtime?.companyId): Promise<string> {
+  const ref = normalizeSecretRef(config.paperclipApiKeyRef);
+  if (ref && companyId) {
+    try {
+      const key = await ctx.secrets.resolve(ref as unknown as string, { companyId, configPath: "paperclipApiKeyRef" });
+      if (key) {
+        if (runtimeHealth.details?.issue === "slack-confirmation-api-key-unresolved") {
+          setRuntimeHealth({ status: "ok" });
+        }
+        return key;
+      }
+    } catch (err) {
+      ctx.logger.warn("Unable to resolve Paperclip API key secret reference", {
+        error: redactSecretRefs(String(err), config.paperclipApiKeyRef), companyId,
+      });
+    }
+  }
+  if (config.notifyOnRequestConfirmationCreated === true &&
+      (runtimeHealth.status === "ok" || runtimeHealth.details?.issue === "slack-confirmation-api-key-unresolved")) {
+    degradeHealth("Issue-thread confirmations are enabled but paperclipApiKeyRef is missing or could not be resolved. Configure a Paperclip API key secret reference.",
+      "slack-confirmation-api-key-unresolved", { companyId });
+  }
+  return "";
+}
+
+async function fetchPaperclipApi(
+  ctx: PluginContext,
+  config: SlackConfig,
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const apiKey = await resolvePaperclipApiKey(ctx, config);
+  if (!apiKey) throw new Error("Paperclip API key is not configured");
+
+  const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
+  const url = new URL(path, baseUrl).toString();
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${apiKey}`);
+  if (init.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  return fetch(url, { ...init, headers });
+}
+
+async function fetchIssueInteractions(
+  ctx: PluginContext,
+  config: SlackConfig,
+  issueId: string,
+): Promise<RequestConfirmationInteraction[]> {
+  const response = await fetchPaperclipApi(
+    ctx,
+    config,
+    `/api/issues/${encodeURIComponent(issueId)}/interactions`,
+  );
+  if (!response.ok) {
+    throw new Error(`Paperclip interactions fetch failed with ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (!Array.isArray(body)) return [];
+  return body.filter(isRequestConfirmationInteraction);
+}
+
+async function resolveIssueInteraction(
+  ctx: PluginContext,
+  config: SlackConfig,
+  issueId: string,
+  interactionId: string,
+  accepted: boolean,
+): Promise<RequestConfirmationInteraction> {
+  const action = accepted ? "accept" : "reject";
+  const response = await fetchPaperclipApi(
+    ctx,
+    config,
+    `/api/issues/${encodeURIComponent(issueId)}/interactions/${encodeURIComponent(interactionId)}/${action}`,
+    {
+      method: "POST",
+      body: JSON.stringify(accepted ? {} : { reason: "" }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`Paperclip interaction ${action} failed with ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (!isRequestConfirmationInteraction(body)) {
+    throw new Error("Paperclip returned an unexpected interaction response");
+  }
+  return body;
+}
+
+async function listInteractionCandidateIssues(
+  ctx: PluginContext,
+  config: SlackConfig,
+  companyId: string,
+): Promise<Issue[]> {
+  const query = new URLSearchParams({ status: INTERACTION_SCAN_STATUSES.join(",") });
+  const response = await fetchPaperclipApi(
+    ctx,
+    config,
+    `/api/companies/${encodeURIComponent(companyId)}/issues?${query.toString()}`,
+  );
+  if (!response.ok) {
+    throw new Error(`Paperclip issue list failed with ${response.status}`);
+  }
+  const body = await response.json() as unknown;
+  if (!Array.isArray(body)) return [];
+
+  const byId = new Map<string, Issue>();
+  for (const issue of body) {
+    if (issue && typeof issue === "object" && "id" in issue) {
+      const current = issue as Issue;
+      if (typeof current.id === "string") {
+        byId.set(current.id, current);
+      }
+    }
+  }
+  return [...byId.values()];
+}
+
+async function syncIssueInteractions(
+  ctx: PluginContext,
+  token: string,
+  config: SlackConfig,
+  companyId: string,
+): Promise<void> {
+  if (config.notifyOnRequestConfirmationCreated !== true) return;
+
+  const apiKey = await resolvePaperclipApiKey(ctx, config);
+  if (!apiKey) return;
+
+  const channelId = config.approvalsChannelId || config.defaultChannelId;
+  if (!channelId) return;
+
+  const issues = await listInteractionCandidateIssues(ctx, config, companyId);
+  for (const issue of issues) {
+    let interactions: RequestConfirmationInteraction[] = [];
+    try {
+      interactions = await fetchIssueInteractions(ctx, config, issue.id);
+    } catch (err) {
+      ctx.logger.warn("Unable to fetch issue-thread interactions", {
+        issueId: issue.id,
+        identifier: issue.identifier,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+
+    for (const interaction of interactions) {
+      if (!isRequestConfirmationInteraction(interaction)) continue;
+
+      const sent = await readInteractionSlackMessage(companyId, interaction.id);
+
+      if (interaction.status === "pending") {
+        if (sent?.ts) continue;
+        const result = await postMessage(
+          ctx,
+          token,
+          channelId,
+          formatRequestConfirmationInteraction(issue, interaction, config.paperclipBaseUrl),
+        );
+        if (result.ok && result.ts) {
+          await writeInteractionSlackMessage(companyId, interaction.id, { channelId, ts: result.ts, status: interaction.status });
+          await ctx.metrics.write("slack.interactions.sent", 1, { interaction_kind: interaction.kind })
+            .catch(() => undefined);
+        }
+        continue;
+      }
+
+      if (sent?.ts && sent.channelId && sent.status !== interaction.status) {
+        await updateMessage(
+          ctx,
+          token,
+          sent.channelId,
+          sent.ts,
+          formatRequestConfirmationStatus(issue, interaction, config.paperclipBaseUrl),
+        );
+        await writeInteractionSlackMessage(companyId, interaction.id, { ...sent, status: interaction.status });
+      }
+    }
+  }
+}
+
+async function handleSlackEventsPayload(body: Record<string, unknown>): Promise<void> {
+  const event = body.event as Record<string, unknown> | undefined;
+  if (!event) return;
+
+  const companyId = await getDefaultCompanyId(pluginCtx).catch((err) => {
+    pluginCtx.logger.warn("Unable to resolve company for Slack event", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return "";
+  });
+  if (!companyId) return;
+  const eventType = String(event.type ?? "");
+
+  if (eventType === "file_shared") {
+    const fileId = String(event.file_id ?? "");
+    const channelId = String(event.channel_id ?? event.channel ?? "");
+    if (fileId && channelId) {
+      await processMediaFile(pluginCtx, pluginToken, companyId, fileId, channelId, "");
+    }
+    return;
+  }
+
+  if (eventType === "message") {
+    if (event.bot_id || (event.subtype && event.subtype !== "file_share")) return;
+    await handleSlackThreadMessageEvent(companyId, event);
+    return;
+  }
+
+  if (eventType === "app_mention") {
+    const routed = await handleSlackThreadMessageEvent(companyId, event);
+    if (!routed) {
+      const channel = String(event.channel ?? "");
+      const threadTs = String(event.thread_ts ?? event.ts ?? "");
+      if (channel && threadTs) {
+        await postMessage(pluginCtx, pluginToken, channel, {
+          text: "No active Paperclip agents are attached to this thread. Use `/clip acp spawn <agent>` first.",
+        }, { threadTs });
+      }
+    }
+  }
+}
+
+async function handleSlackThreadMessageEvent(
+  companyId: string,
+  event: Record<string, unknown>,
+): Promise<boolean> {
+  const channel = String(event.channel ?? event.channel_id ?? "");
+  const threadTs = String(event.thread_ts ?? event.ts ?? "");
+  const text = String(event.text ?? "");
+  const replyToMessageTs = event.ts != null ? String(event.ts) : undefined;
+  const files = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
+
+  if (!channel || !threadTs) return false;
+
+  return handleThreadMessage(companyId, {
+    channel,
+    threadTs,
+    text,
+    replyToMessageTs,
+    files,
+  });
+}
+
+async function handleThreadMessage(
+  companyId: string,
+  input: {
+    channel: string;
+    threadTs: string;
+    text: string;
+    replyToMessageTs?: string;
+    files: Array<Record<string, unknown>>;
+  },
+): Promise<boolean> {
+  if (!input.channel || !input.threadTs) return false;
+
+  let handled = false;
+
+  for (const file of input.files) {
+    const fileId = String(file.id ?? "");
+    const mimetype = String(file.mimetype ?? "");
+    if (fileId && isMediaFile(mimetype)) {
+      await processMediaFile(pluginCtx, pluginToken, companyId, fileId, input.channel, input.threadTs);
+      handled = true;
+    }
+  }
+
+  if (!input.text) return handled;
+
+  const customCommandHandled = await tryCustomCommand(
+    pluginCtx,
+    pluginToken,
+    companyId,
+    input.channel,
+    input.threadTs,
+    input.text,
+  );
+  if (customCommandHandled) return true;
+
+  const routedToAgent = await routeMessageToAgent(
+    pluginCtx,
+    companyId,
+    input.channel,
+    input.threadTs,
+    input.text,
+    input.replyToMessageTs,
+  );
+  return handled || routedToAgent;
+}
+
+async function handleInteractivityPayload(payload: Record<string, unknown>): Promise<void> {
+  if (payload.type !== "block_actions") return;
+
+  const actions = payload.actions as Array<Record<string, unknown>>;
+  const responseUrl = String(payload.response_url ?? "");
+  const user = payload.user as Record<string, unknown> | undefined;
+  const userId = user ? String(user.id ?? user.username ?? "unknown") : "unknown";
+
+  if (!actions?.length || !responseUrl) return;
+
+  const action = actions[0];
+  const actionId = String(action.action_id ?? "");
+  const actionValue = String(action.value ?? "");
+
+  if (!actionValue) return;
+
+  const companyId = await getDefaultCompanyId(pluginCtx).catch((err) => {
+    pluginCtx.logger.warn("Unable to resolve company for Slack interaction", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return "";
+  });
+  if (!companyId) return;
+
+  if (actionId === INTERACTION_ACCEPT_ACTION_ID || actionId === INTERACTION_REJECT_ACTION_ID) {
+    const ref = decodeInteractionActionValue(actionValue);
+    if (!ref) {
+      await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        text: "Could not resolve this Paperclip confirmation action.",
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: ":warning: Could not resolve this Paperclip confirmation action." },
+          },
+        ],
+      });
+      return;
+    }
+
+    const accepted = actionId === INTERACTION_ACCEPT_ACTION_ID;
+    const live = pluginConfig;
+    try {
+      const issue = await pluginCtx.issues.get(ref.issueId, companyId);
+      if (!issue || issue.companyId !== companyId) throw new Error("Confirmation issue is outside this installation's company");
+      const latest = (await fetchIssueInteractions(pluginCtx, live, ref.issueId))
+        .find((candidate) => candidate.id === ref.interactionId);
+      if (!latest) throw new Error("Confirmation is no longer available");
+      if (latest.status !== "pending") {
+        await respondToAction(pluginCtx, pluginToken, responseUrl,
+          formatRequestConfirmationStatus(issue, latest, live.paperclipBaseUrl));
+        return;
+      }
+      if ((accepted && latest.kind === "request_checkbox_confirmation") ||
+          (!accepted && latest.payload?.rejectRequiresReason === true)) {
+        await respondToAction(pluginCtx, pluginToken, responseUrl,
+          formatRequestConfirmationInteraction(issue, latest, live.paperclipBaseUrl));
+        return;
+      }
+      const existing = await readInteractionSlackMessage(companyId, ref.interactionId);
+      const interaction = await resolveIssueInteraction(
+        pluginCtx,
+        live,
+        ref.issueId,
+        ref.interactionId,
+        accepted,
+      );
+      const resolvedMessage = formatRequestConfirmationStatus(
+        {
+          id: ref.issueId,
+          identifier: issue.identifier,
+          title: issue.title,
+        },
+        interaction,
+        live.paperclipBaseUrl,
+        userId,
+      );
+      await respondToAction(
+        pluginCtx,
+        pluginToken,
+        responseUrl,
+        resolvedMessage,
+      ).catch(() => undefined);
+      if (existing) {
+        await updateMessage(pluginCtx, pluginToken, existing.channelId, existing.ts, resolvedMessage);
+        await writeInteractionSlackMessage(companyId, ref.interactionId, { ...existing, status: interaction.status });
+      }
+      await pluginCtx.metrics.write("slack.interactions.resolved", 1, {
+        decision: accepted ? "accept" : "reject",
+      }).catch(() => undefined);
+    } catch (err) {
+      pluginCtx.logger.warn("Failed to resolve Paperclip confirmation from Slack", {
+        interactionId: ref.interactionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        text: "Could not resolve this Paperclip confirmation. Check Paperclip API auth and try again.",
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: ":warning: Could not resolve this Paperclip confirmation. Check Paperclip API auth and try again.",
+            },
+          },
+        ],
+      });
+    }
+    return;
+  }
+
+
+  if (actionId === "approval_approve" || actionId === "approval_reject") {
+    const approved = actionId === "approval_approve";
+    const endpoint = approved ? "approve" : "reject";
+    try {
+      await pluginCtx.http.fetch(
+        `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
+        },
+      );
+
+      await respondToAction(
+        pluginCtx,
+        pluginToken,
+        responseUrl,
+        formatApprovalResolved(actionValue, approved, userId),
+      );
+      await pluginCtx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
+    } catch (err) {
+      pluginCtx.logger.warn("Failed to handle approval action", { err, approvalId: actionValue });
+    }
+    return;
+  }
+
+  if (
+    actionId === "escalation_use_suggested" ||
+    actionId === "escalation_reply" ||
+    actionId === "escalation_override" ||
+    actionId === "escalation_dismiss"
+  ) {
+    try {
+      const record = await pluginCtx.state.get({
+        scopeKind: "company",
+        scopeId: companyId,
+        stateKey: STATE_KEYS.escalationRecord(actionValue),
+      }) as Record<string, unknown> | null;
+
+      if (record) {
+        await pluginCtx.state.set(
+          { scopeKind: "company", scopeId: companyId, stateKey: STATE_KEYS.escalationRecord(actionValue) },
+          { ...record, status: "resolved", resolvedAt: new Date().toISOString(), resolvedBy: `slack:${userId}` },
+        );
+      }
+
+      await respondToAction(
+        pluginCtx,
+        pluginToken,
+        responseUrl,
+        formatEscalationResolved(actionValue, actionId, userId),
+      );
+      await pluginCtx.metrics.write("slack.escalations.resolved", 1, { action: actionId });
+    } catch (err) {
+      pluginCtx.logger.warn("Failed to handle escalation action", { err, escalationId: actionValue });
+    }
+    return;
+  }
+
+  if (actionId === "handoff_approve" || actionId === "handoff_reject") {
+    try {
+      const approved = actionId === "handoff_approve";
+      await handleHandoffAction(pluginCtx, pluginToken, companyId, actionValue, approved, userId);
+
+      const emoji = approved ? ":white_check_mark:" : ":x:";
+      const label = approved ? "Approved" : "Rejected";
+      await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        text: `Handoff ${label} by ${userId}`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `${emoji} *Handoff ${label}* by <@${userId}>`,
+            },
+          },
+        ],
+      });
+    } catch (err) {
+      pluginCtx.logger.warn("Failed to handle handoff action", { err, handoffId: actionValue });
+    }
+    return;
+  }
+
+  if (actionId === "discussion_continue" || actionId === "discussion_stop") {
+    try {
+      const discAction = actionId === "discussion_continue" ? "continue" as const : "stop" as const;
+      await handleDiscussionAction(pluginCtx, pluginToken, companyId, actionValue, discAction, userId);
+
+      const emoji = discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
+      const label = discAction === "continue" ? "Resumed" : "Stopped";
+      await respondToAction(pluginCtx, pluginToken, responseUrl, {
+        text: `Discussion ${label} by ${userId}`,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `${emoji} *Discussion ${label}* by <@${userId}>`,
+            },
+          },
+        ],
+      });
+    } catch (err) {
+      pluginCtx.logger.warn("Failed to handle discussion action", { err, discussionId: actionValue });
+    }
+    return;
+  }
+
+  if (actionId === "command_step_approve" || actionId === "command_step_reject") {
+    const approved = actionId === "command_step_approve";
+    const emoji = approved ? ":white_check_mark:" : ":x:";
+    const label = approved ? "Approved" : "Rejected";
+    await respondToAction(pluginCtx, pluginToken, responseUrl, {
+      text: `Step ${label} by ${userId}`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text: `${emoji} *Step ${label}* by <@${userId}>`,
+          },
+        },
+      ],
+    });
   }
 }
 
@@ -1465,6 +2086,12 @@ const plugin = definePlugin({
       }
     });
 
+    // Issue-thread confirmation sync
+    ctx.jobs.register("check-issue-interactions", async () => {
+      const rt = ensureRuntime();
+      if (rt) await syncIssueInteractions(ctx, rt.token, rt.config, rt.companyId);
+    });
+
     // Phase 5: Check watches job
     ctx.jobs.register("check-watches", async () => {
       const rt = ensureRuntime();
@@ -1583,32 +2210,13 @@ const plugin = definePlugin({
       const rt = ensureRuntime(event.companyId);
       if (!rt) return;
       const p = event.payload as Record<string, unknown>;
-      const channel = String(p.channel ?? "");
-      const threadTs = String(p.threadTs ?? "");
-      const text = String(p.text ?? "");
-      const replyToMessageTs = p.replyToMessageTs != null ? String(p.replyToMessageTs) : undefined;
-      const files = Array.isArray(p.files) ? p.files as Array<Record<string, unknown>> : [];
-      if (!channel || !threadTs) return;
-
-      // Phase 3: Check for media files
-      for (const file of files) {
-        const fileId = String(file.id ?? "");
-        const mimetype = String(file.mimetype ?? "");
-        if (fileId && isMediaFile(mimetype)) {
-          await processMediaFile(ctx, rt.token, event.companyId, fileId, channel, threadTs);
-        }
-      }
-
-      // Phase 4: Check for custom commands
-      if (text) {
-        const handled = await tryCustomCommand(ctx, rt.token, event.companyId, channel, threadTs, text);
-        if (handled) return;
-      }
-
-      // Phase 2: Route to agent sessions
-      if (text) {
-        await routeMessageToAgent(ctx, event.companyId, channel, threadTs, text, replyToMessageTs);
-      }
+      await handleThreadMessage(event.companyId, {
+        channel: String(p.channel ?? ""),
+        threadTs: String(p.threadTs ?? ""),
+        text: String(p.text ?? ""),
+        replyToMessageTs: p.replyToMessageTs != null ? String(p.replyToMessageTs) : undefined,
+        files: Array.isArray(p.files) ? p.files as Array<Record<string, unknown>> : [],
+      });
     });
 
     // Collect events for watch checking (Phase 5)
@@ -1735,188 +2343,12 @@ const plugin = definePlugin({
       return;
     }
 
-    // Slack Events API (url_verification + event callbacks)
-    if (input.endpointKey === WEBHOOK_KEYS.slackEvents) {
-      if (body?.type === "url_verification") {
-        return;
-      }
+    await dispatchSlackWebhook(input, createSharedSlackTransportHandlers());
+  },
 
-      // Handle file_shared events for Phase 3 media pipeline
-      if (body?.type === "event_callback") {
-        const event = body.event as Record<string, unknown> | undefined;
-        if (event?.type === "file_shared") {
-          const companyId = rt.companyId;
-          const fileId = String(event.file_id ?? "");
-          const channelId = String(event.channel_id ?? "");
-
-          if (fileId && channelId) {
-            await processMediaFile(pluginCtx, rt.token, companyId, fileId, channelId, "");
-          }
-        }
-      }
-    }
-
-    // Slash commands
-    if (input.endpointKey === WEBHOOK_KEYS.slashCommand) {
-      await handleSlashCommand(pluginCtx, input.rawBody, rt.companyId);
-      return;
-    }
-
-    // Interactivity (button clicks)
-    if (input.endpointKey === WEBHOOK_KEYS.interactivity) {
-      const payload = body?.payload
-        ? JSON.parse(String(body.payload)) as Record<string, unknown>
-        : body;
-      if (!payload || payload.type !== "block_actions") return;
-
-      const actions = payload.actions as Array<Record<string, unknown>>;
-      const responseUrl = String(payload.response_url ?? "");
-      const user = payload.user as Record<string, unknown> | undefined;
-      const userId = user ? String(user.id ?? user.username ?? "unknown") : "unknown";
-
-      if (!actions?.length || !responseUrl) return;
-
-      const action = actions[0];
-      const actionId = String(action.action_id ?? "");
-      const actionValue = String(action.value ?? "");
-
-      if (!actionValue) return;
-
-      const companyId = rt.companyId;
-
-      // --- Approval buttons ---
-      if (actionId === "approval_approve" || actionId === "approval_reject") {
-        const approved = actionId === "approval_approve";
-        const endpoint = approved ? "approve" : "reject";
-        try {
-          await pluginCtx.http.fetch(
-            `${pluginConfig.paperclipBaseUrl}/api/approvals/${actionValue}/${endpoint}`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ decidedByUserId: `slack:${userId}` }),
-            },
-          );
-
-          await respondToAction(
-            pluginCtx,
-            pluginToken,
-            responseUrl,
-            formatApprovalResolved(actionValue, approved, userId),
-          );
-          await pluginCtx.metrics.write("slack.approvals.decided", 1, { decision: endpoint });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle approval action", { err, approvalId: actionValue });
-        }
-        return;
-      }
-
-      // --- Escalation buttons ---
-      if (
-        actionId === "escalation_use_suggested" ||
-        actionId === "escalation_reply" ||
-        actionId === "escalation_override" ||
-        actionId === "escalation_dismiss"
-      ) {
-        try {
-          const record = await pluginCtx.state.get({
-            scopeKind: "company",
-            scopeId: companyId,
-            stateKey: STATE_KEYS.escalationRecord(actionValue),
-          }) as Record<string, unknown> | null;
-
-          if (record) {
-            await pluginCtx.state.set(
-              { scopeKind: "company", scopeId: companyId, stateKey: STATE_KEYS.escalationRecord(actionValue) },
-              { ...record, status: "resolved", resolvedAt: new Date().toISOString(), resolvedBy: `slack:${userId}` },
-            );
-          }
-
-          await respondToAction(
-            pluginCtx,
-            pluginToken,
-            responseUrl,
-            formatEscalationResolved(actionValue, actionId, userId),
-          );
-          await pluginCtx.metrics.write("slack.escalations.resolved", 1, { action: actionId });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle escalation action", { err, escalationId: actionValue });
-        }
-        return;
-      }
-
-      // --- Handoff buttons ---
-      if (actionId === "handoff_approve" || actionId === "handoff_reject") {
-        try {
-          const approved = actionId === "handoff_approve";
-          await handleHandoffAction(pluginCtx, pluginToken, companyId, actionValue, approved, userId);
-
-          const emoji = approved ? ":white_check_mark:" : ":x:";
-          const label = approved ? "Approved" : "Rejected";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
-            text: `Handoff ${label} by ${userId}`,
-            blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `${emoji} *Handoff ${label}* by <@${userId}>`,
-                },
-              },
-            ],
-          });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle handoff action", { err, handoffId: actionValue });
-        }
-        return;
-      }
-
-      // --- Discussion loop buttons ---
-      if (actionId === "discussion_continue" || actionId === "discussion_stop") {
-        try {
-          const discAction = actionId === "discussion_continue" ? "continue" as const : "stop" as const;
-          await handleDiscussionAction(pluginCtx, pluginToken, companyId, actionValue, discAction, userId);
-
-          const emoji = discAction === "continue" ? ":arrow_forward:" : ":stop_button:";
-          const label = discAction === "continue" ? "Resumed" : "Stopped";
-          await respondToAction(pluginCtx, pluginToken, responseUrl, {
-            text: `Discussion ${label} by ${userId}`,
-            blocks: [
-              {
-                type: "section",
-                text: {
-                  type: "mrkdwn",
-                  text: `${emoji} *Discussion ${label}* by <@${userId}>`,
-                },
-              },
-            ],
-          });
-        } catch (err) {
-          pluginCtx.logger.warn("Failed to handle discussion action", { err, discussionId: actionValue });
-        }
-        return;
-      }
-
-      // --- Command step approval buttons (Phase 4) ---
-      if (actionId === "command_step_approve" || actionId === "command_step_reject") {
-        const approved = actionId === "command_step_approve";
-        const emoji = approved ? ":white_check_mark:" : ":x:";
-        const label = approved ? "Approved" : "Rejected";
-        await respondToAction(pluginCtx, pluginToken, responseUrl, {
-          text: `Step ${label} by ${userId}`,
-          blocks: [
-            {
-              type: "section",
-              text: {
-                type: "mrkdwn",
-                text: `${emoji} *Step ${label}* by <@${userId}>`,
-              },
-            },
-          ],
-        });
-        return;
-      }
-    }
+  async onShutdown(): Promise<void> {
+    socketModeClient?.stop();
+    socketModeClient = null;
   },
 
   async onValidateConfig(config) {

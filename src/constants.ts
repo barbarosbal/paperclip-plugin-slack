@@ -31,13 +31,16 @@ export const STATE_KEYS = {
   dailyAgentCosts: (date: string) => `daily-agent-costs-${date}`,
   firstRunNotified: (id: string) => `first-run-notified-${id}`,
   budgetAlert: (id: string, bucket: number) => `budget-alert-${id}-${bucket}`,
+  interactionSlackMessage: (id: string) => `interaction-slack-message-${id}`,
   watchRegistry: (ch: string, ts: string) => `watches_${ch}_${ts}`,
   commandRegistry: "custom-commands",
 } as const;
 
 export const DEFAULT_CONFIG = {
   slackTokenRef: "",
+  slackAppTokenRef: "",
   slackSigningSecretRef: "",
+  paperclipApiKeyRef: "",
   defaultChannelId: "",
   approvalsChannelId: "",
   errorsChannelId: "",
@@ -46,6 +49,7 @@ export const DEFAULT_CONFIG = {
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
+  notifyOnRequestConfirmationCreated: false,
   notifyOnAgentError: true,
   notifyOnAgentConnected: true,
   notifyOnBudgetThreshold: true,

@@ -617,3 +617,195 @@ describe("round-1 review fixes", () => {
     expect(_getRuntimeForTests()?.baseUrl).toBe(baseBefore);
   });
 });
+
+describe("Socket Mode invocation lifetime", () => {
+  it("handles owner-scoped commands after config delivery expires and ignores configured tenant overrides", async () => {
+    const { AsyncLocalStorage, AsyncResource } = await import("node:async_hooks");
+    const invocations = new AsyncLocalStorage<string>();
+    let socket: any;
+    class Socket {
+      resource = new AsyncResource("slack-test-socket");
+      listeners = new Map<string, Function>();
+      readyState = 1;
+      constructor(_url: string) { socket = this; }
+      addEventListener(name: string, fn: Function) { this.listeners.set(name, fn); }
+      send = vi.fn();
+      close() {}
+      fire(data: unknown) {
+        this.resource.runInAsyncScope(() => this.listeners.get("message")?.({ data: JSON.stringify(data) }));
+      }
+    }
+    vi.stubGlobal("WebSocket", Socket);
+    const host = buildHost();
+    const seen: unknown[] = [];
+    host.ctx.agents.list.mockImplementation(async ({ companyId }: { companyId: string }) => {
+      seen.push({ invocation: invocations.getStore(), companyId });
+      if (invocations.getStore()) throw new Error("expired invocation");
+      if (companyId !== COMPANY_A) throw new Error("foreign tenant");
+      return [];
+    });
+    let releaseOpen!: () => void;
+    const pendingOpen = new Promise<void>((resolve) => { releaseOpen = resolve; });
+    host.ctx.http.fetch.mockImplementation(async (url: string) => {
+      if (url.includes("apps.connections.open")) await pendingOpen;
+      return {
+      ok: true, json: async () => url.includes("apps.connections.open")
+        ? { ok: true, url: "wss://slack.invalid/socket" } : { ok: true }, text: async () => "",
+    }; });
+    try {
+      await definition().setup(host.ctx);
+      await invocations.run("configuration-1", () => host.deliver(COMPANY_A, storedConfig({
+        slackAppTokenRef: { type: "secret_ref", secretId: SECRET_ID }, companyId: COMPANY_B,
+      })));
+      expect(socket).toBeUndefined(); // Configuration completed while Slack HTTP is unresolved.
+      releaseOpen();
+      await vi.waitFor(() => expect(socket).toBeDefined());
+      socket.fire({ envelope_id: "1", type: "slash_commands", payload: {
+        command: "/clip", text: "status", response_url: "https://hooks.slack.invalid/response", channel_id: "C1",
+      } });
+      await vi.waitFor(() => expect(seen).toEqual([{ invocation: undefined, companyId: COMPANY_A }]));
+      expect(host.ctx.companies.list).not.toHaveBeenCalled();
+      await host.deliver(COMPANY_B, storedConfig({ slackAppTokenRef: { type: "secret_ref", secretId: SECRET_ID } }));
+      expect(_getRuntimeForTests()?.companyId).toBe(COMPANY_A);
+      expect(host.ctx.secrets.resolve).toHaveBeenCalledWith(
+        { type: "secret_ref", secretId: SECRET_ID },
+        { companyId: COMPANY_A, configPath: "slackAppTokenRef" },
+      );
+    } finally {
+      await definition().onShutdown();
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("company-scoped confirmation deduplication", () => {
+  it("persists deduplication through host state and fails closed when its read is unavailable", async () => {
+    const host = buildHost();
+    host.ctx.metrics.write.mockResolvedValue(undefined);
+    const jobs = new Map<string, Function>();
+    host.ctx.jobs.register.mockImplementation((key: string, callback: Function) => jobs.set(key, callback));
+    const outbound = vi.fn(async (url: string) => ({ ok: true, json: async () =>
+      url.includes("/interactions") ? [{ id: "interaction-1", kind: "request_confirmation", status: "pending" }]
+        : [{ id: "issue-1", companyId: COMPANY_A, title: "Test", status: "todo" }],
+    }));
+    vi.stubGlobal("fetch", outbound);
+    host.ctx.http.fetch.mockResolvedValue({ ok: true, json: async () => ({ ok: true, ts: "123.456" }) });
+    try {
+      await definition().setup(host.ctx);
+      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKeyRef: { type: "secret_ref", secretId: SECRET_ID }, notifyOnRequestConfirmationCreated: true }));
+      const job = jobs.get("check-issue-interactions")!;
+      await job();
+      await job();
+      expect(host.ctx.http.fetch).toHaveBeenCalledTimes(1);
+      expect(host.ctx.state.set).toHaveBeenCalledWith({ scopeKind: "company", scopeId: COMPANY_A,
+        stateKey: "interaction-slack-message-interaction-1" }, expect.objectContaining({ ts: "123.456" }));
+      host.ctx.state.get.mockRejectedValueOnce(new Error("host state unavailable"));
+      await expect(job()).rejects.toThrow("host state unavailable");
+      expect(host.ctx.http.fetch).toHaveBeenCalledTimes(1);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
+
+describe("authoritative confirmation input validation", () => {
+  it.each([
+    ["request_checkbox_confirmation", false, "interaction_accept", false],
+    ["request_confirmation", true, "interaction_reject", false],
+    ["request_confirmation", false, "interaction_accept", true],
+    ["request_confirmation", false, "interaction_reject", true],
+    ["request_checkbox_confirmation", false, "interaction_reject", true],
+  ])("validates latest %s before %s / %s", async (kind, rejectRequiresReason, actionId, canMutate) => {
+    const { createHmac } = await import("node:crypto");
+    const host = buildHost();
+    host.ctx.issues.get = vi.fn(async () => ({ id: "issue-1", companyId: COMPANY_A, title: "Title" }));
+    host.ctx.metrics.write.mockResolvedValue(undefined);
+    const requests: string[] = [];
+    const api = vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(init?.method ?? "GET");
+      const current = { id: "interaction-1", kind, status: "pending", payload: { rejectRequiresReason } };
+      return { ok: true, json: async () => init?.method === "POST" ? { ...current, status: "accepted" } : [current] };
+    });
+    vi.stubGlobal("fetch", api);
+    host.ctx.http.fetch.mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    try {
+      await definition().setup(host.ctx);
+      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKeyRef: { type: "secret_ref", secretId: SECRET_ID } }));
+      const parsedBody = { type: "block_actions", response_url: "https://hooks.slack.test/response", actions: [{ action_id: actionId, value: JSON.stringify({ issueId: "issue-1", interactionId: "interaction-1" }) }] };
+      const rawBody = JSON.stringify(parsedBody);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const signature = "v0=" + createHmac("sha256", "signing-secret").update(`v0:${timestamp}:${rawBody}`).digest("hex");
+      await definition().onWebhook({ endpointKey: "slack-interactivity", rawBody, parsedBody, headers: { "x-slack-request-timestamp": timestamp, "x-slack-signature": signature } });
+      expect(requests).toEqual(canMutate ? ["GET", "POST"] : ["GET"]);
+      expect(JSON.stringify(host.ctx.http.fetch.mock.calls)).toContain("interaction_view_issue");
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
+
+describe("confirmation credential health", () => {
+  it("keeps optional confirmations disabled and healthy by default", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig());
+    expect(_getRuntimeForTests()?.config.notifyOnRequestConfirmationCreated).toBe(false);
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+    expect(host.ctx.secrets.resolve.mock.calls.some((call: any[]) => call[1]?.configPath === "paperclipApiKeyRef")).toBe(false);
+  });
+
+  it.each(["missing", "unresolved"])("degrades enabled confirmations with %s API credentials", async (mode) => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "paperclipApiKeyRef") throw new Error("fixture resolver unavailable");
+      return options.configPath === "slackSigningSecretRef" ? "signing-secret" : "xoxb-token";
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true,
+      ...(mode === "unresolved" ? { paperclipApiKeyRef: SECRET_ID } : {}),
+    }));
+    expect(await definition().onHealth()).toMatchObject({ status: "degraded",
+      details: { issue: "slack-confirmation-api-key-unresolved", companyId: COMPANY_A } });
+    expect((await definition().onHealth()).message).toContain("paperclipApiKeyRef");
+  });
+
+  it("normalizes the API reference for the owner and recovers on a valid save", async () => {
+    const host = buildHost();
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true }));
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+    expect(host.ctx.secrets.resolve).toHaveBeenCalledWith({ type: "secret_ref", secretId: SECRET_ID },
+      { companyId: COMPANY_A, configPath: "paperclipApiKeyRef" });
+    expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+  });
+});
+
+describe("confirmation credential diagnostic ownership", () => {
+  it.each([false, true])("preserves unrelated signing degradation when the API key resolves: %s", async (apiResolves) => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "slackSigningSecretRef") throw new Error("fixture signing unavailable");
+      if (options.configPath === "paperclipApiKeyRef" && !apiResolves) throw new Error("fixture API unavailable");
+      return "fixture-key";
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+    expect(await definition().onHealth()).toMatchObject({ status: "degraded", details: { issue: "slack-signing-secret-unresolved" } });
+  });
+
+  it("clears its own transient degradation on the next successful job without another config save", async () => {
+    const host = buildHost();
+    let apiResolves = false;
+    const jobs = new Map<string, Function>();
+    host.ctx.jobs.register.mockImplementation((key: string, fn: Function) => jobs.set(key, fn));
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "paperclipApiKeyRef" && !apiResolves) throw new Error("fixture API unavailable");
+      return "fixture-key";
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+    try {
+      await definition().setup(host.ctx);
+      await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+      expect(await definition().onHealth()).toMatchObject({ status: "degraded", details: { issue: "slack-confirmation-api-key-unresolved" } });
+      apiResolves = true;
+      await jobs.get("check-issue-interactions")!();
+      expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
