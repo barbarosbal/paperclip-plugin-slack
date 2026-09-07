@@ -227,7 +227,7 @@ npm test
 npm run build
 ```
 
-129 tests covering notifications, approvals, escalation, session registry, media pipeline, custom commands, proactive suggestions, Block Kit formatting, Socket Mode, and slash commands.
+Tests cover notifications, approvals, escalation, session registry, media pipeline, custom commands, proactive suggestions, Block Kit formatting, Socket Mode, and slash commands.
 
 For full local verification, run `npm run verify`. For the standalone diagnostic script only, set `SLACK_APP_TOKEN` and run `npm run smoke:socket` to verify that Slack returns a Socket Mode WebSocket URL. Installed plugin workers use `slackAppTokenRef` and `paperclipApiKeyRef`; they do not read host environment credentials or package `.env` files.
 

@@ -120,7 +120,7 @@ const manifest: PaperclipPluginManifestV1 = {
       notifyOnRequestConfirmationCreated: {
         type: "boolean",
         title: "Notify on issue-thread confirmations",
-        description: "Posts pending request_confirmation cards from Paperclip issue threads to Slack with Accept/Reject buttons.",
+        description: "Posts pending simple and checkbox confirmations. Buttons are available when no additional input is needed; choose options or provide required decline reasons in Paperclip. Requires paperclipApiKeyRef.",
         default: DEFAULT_CONFIG.notifyOnRequestConfirmationCreated,
       },
       notifyOnAgentError: {

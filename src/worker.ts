@@ -814,14 +814,20 @@ async function resolvePaperclipApiKey(ctx: PluginContext, config: SlackConfig, c
   if (ref && companyId) {
     try {
       const key = await ctx.secrets.resolve(ref as unknown as string, { companyId, configPath: "paperclipApiKeyRef" });
-      if (key) return key;
+      if (key) {
+        if (runtimeHealth.details?.issue === "slack-confirmation-api-key-unresolved") {
+          setRuntimeHealth({ status: "ok" });
+        }
+        return key;
+      }
     } catch (err) {
       ctx.logger.warn("Unable to resolve Paperclip API key secret reference", {
         error: redactSecretRefs(String(err), config.paperclipApiKeyRef), companyId,
       });
     }
   }
-  if (config.notifyOnRequestConfirmationCreated === true) {
+  if (config.notifyOnRequestConfirmationCreated === true &&
+      (runtimeHealth.status === "ok" || runtimeHealth.details?.issue === "slack-confirmation-api-key-unresolved")) {
     degradeHealth("Issue-thread confirmations are enabled but paperclipApiKeyRef is missing or could not be resolved. Configure a Paperclip API key secret reference.",
       "slack-confirmation-api-key-unresolved", { companyId });
   }

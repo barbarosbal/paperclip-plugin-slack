@@ -775,3 +775,37 @@ describe("confirmation credential health", () => {
     expect(await definition().onHealth()).toMatchObject({ status: "ok" });
   });
 });
+
+describe("confirmation credential diagnostic ownership", () => {
+  it.each([false, true])("preserves unrelated signing degradation when the API key resolves: %s", async (apiResolves) => {
+    const host = buildHost();
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "slackSigningSecretRef") throw new Error("fixture signing unavailable");
+      if (options.configPath === "paperclipApiKeyRef" && !apiResolves) throw new Error("fixture API unavailable");
+      return "fixture-key";
+    });
+    await definition().setup(host.ctx);
+    await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+    expect(await definition().onHealth()).toMatchObject({ status: "degraded", details: { issue: "slack-signing-secret-unresolved" } });
+  });
+
+  it("clears its own transient degradation on the next successful job without another config save", async () => {
+    const host = buildHost();
+    let apiResolves = false;
+    const jobs = new Map<string, Function>();
+    host.ctx.jobs.register.mockImplementation((key: string, fn: Function) => jobs.set(key, fn));
+    host.ctx.secrets.resolve.mockImplementation(async (_ref: unknown, options: { configPath: string }) => {
+      if (options.configPath === "paperclipApiKeyRef" && !apiResolves) throw new Error("fixture API unavailable");
+      return "fixture-key";
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => [] })));
+    try {
+      await definition().setup(host.ctx);
+      await host.deliver(COMPANY_A, storedConfig({ notifyOnRequestConfirmationCreated: true, paperclipApiKeyRef: SECRET_ID }));
+      expect(await definition().onHealth()).toMatchObject({ status: "degraded", details: { issue: "slack-confirmation-api-key-unresolved" } });
+      apiResolves = true;
+      await jobs.get("check-issue-interactions")!();
+      expect(await definition().onHealth()).toMatchObject({ status: "ok" });
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
