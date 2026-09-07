@@ -992,7 +992,7 @@ async function syncIssueInteractions(
     }
 
     for (const interaction of interactions) {
-      if (interaction.kind !== "request_confirmation") continue;
+      if (!isRequestConfirmationInteraction(interaction)) continue;
 
       const sent = await readInteractionSlackMessage(companyId, interaction.id);
 
@@ -1179,6 +1179,20 @@ async function handleInteractivityPayload(payload: Record<string, unknown>): Pro
     try {
       const issue = await pluginCtx.issues.get(ref.issueId, companyId);
       if (!issue || issue.companyId !== companyId) throw new Error("Confirmation issue is outside this installation's company");
+      const latest = (await fetchIssueInteractions(pluginCtx, live, ref.issueId))
+        .find((candidate) => candidate.id === ref.interactionId);
+      if (!latest) throw new Error("Confirmation is no longer available");
+      if (latest.status !== "pending") {
+        await respondToAction(pluginCtx, pluginToken, responseUrl,
+          formatRequestConfirmationStatus(issue, latest, live.paperclipBaseUrl));
+        return;
+      }
+      if ((accepted && latest.kind === "request_checkbox_confirmation") ||
+          (!accepted && latest.payload?.rejectRequiresReason === true)) {
+        await respondToAction(pluginCtx, pluginToken, responseUrl,
+          formatRequestConfirmationInteraction(issue, latest, live.paperclipBaseUrl));
+        return;
+      }
       const existing = await readInteractionSlackMessage(companyId, ref.interactionId);
       const interaction = await resolveIssueInteraction(
         pluginCtx,

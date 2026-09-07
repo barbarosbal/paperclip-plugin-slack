@@ -144,25 +144,26 @@ export function formatRequestConfirmationInteraction(
     });
   }
 
-  blocks.push({
-    type: "actions",
-    elements: [
-      {
-        type: "button",
-        text: { type: "plain_text", text: acceptLabel },
-        style: "primary",
-        action_id: INTERACTION_ACCEPT_ACTION_ID,
-        value: actionValue,
-      },
-      {
-        type: "button",
-        text: { type: "plain_text", text: rejectLabel },
-        action_id: INTERACTION_REJECT_ACTION_ID,
-        value: actionValue,
-      },
-      viewIssueButton(paperclipBaseUrl, issue),
-    ],
+  const needsOptions = interaction.kind === "request_checkbox_confirmation";
+  const needsReason = payload.rejectRequiresReason === true;
+  const instructions = [
+    needsOptions ? "Choose options in Paperclip to accept this confirmation." : "",
+    needsReason ? "To reject, provide a decline reason in Paperclip." : "",
+  ].filter(Boolean);
+  if (instructions.length) {
+    blocks.push({ type: "section", text: { type: "mrkdwn", text: instructions.join("\n") } });
+  }
+  const elements: Array<Record<string, unknown>> = [];
+  if (!needsOptions) elements.push({
+    type: "button", text: { type: "plain_text", text: acceptLabel }, style: "primary",
+    action_id: INTERACTION_ACCEPT_ACTION_ID, value: actionValue,
   });
+  if (!needsReason) elements.push({
+    type: "button", text: { type: "plain_text", text: rejectLabel },
+    action_id: INTERACTION_REJECT_ACTION_ID, value: actionValue,
+  });
+  elements.push(viewIssueButton(paperclipBaseUrl, issue));
+  blocks.push({ type: "actions", elements });
 
   return {
     text: `Confirmation requested: ${issueLabel(issue)} - ${title}`,

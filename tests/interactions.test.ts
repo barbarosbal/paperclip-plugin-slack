@@ -95,3 +95,21 @@ describe("request confirmation action values", () => {
     expect(isRequestConfirmationInteraction({ kind: "approval" })).toBe(false);
   });
 });
+
+describe("confirmations requiring Paperclip input", () => {
+  it("links checkbox choices to Paperclip without an Accept button", () => {
+    const msg = formatRequestConfirmationInteraction(issue, { ...interaction, kind: "request_checkbox_confirmation" }, "https://paperclip.test");
+    const json = JSON.stringify(msg);
+    expect(json).not.toContain(INTERACTION_ACCEPT_ACTION_ID);
+    expect(json).toContain(INTERACTION_REJECT_ACTION_ID);
+    expect(json).toContain("Choose options in Paperclip");
+    expect(json).toContain("interaction_view_issue");
+  });
+  it("links required decline reasons to Paperclip without a Reject button", () => {
+    const msg = formatRequestConfirmationInteraction(issue, { ...interaction, payload: { rejectRequiresReason: true } }, "https://paperclip.test");
+    const json = JSON.stringify(msg);
+    expect(json).toContain(INTERACTION_ACCEPT_ACTION_ID);
+    expect(json).not.toContain(INTERACTION_REJECT_ACTION_ID);
+    expect(json).toContain("provide a decline reason in Paperclip");
+  });
+});

@@ -705,3 +705,37 @@ describe("company-scoped confirmation deduplication", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 });
+
+describe("authoritative confirmation input validation", () => {
+  it.each([
+    ["request_checkbox_confirmation", false, "interaction_accept", false],
+    ["request_confirmation", true, "interaction_reject", false],
+    ["request_confirmation", false, "interaction_accept", true],
+    ["request_confirmation", false, "interaction_reject", true],
+    ["request_checkbox_confirmation", false, "interaction_reject", true],
+  ])("validates latest %s before %s / %s", async (kind, rejectRequiresReason, actionId, canMutate) => {
+    const { createHmac } = await import("node:crypto");
+    const host = buildHost();
+    host.ctx.issues.get = vi.fn(async () => ({ id: "issue-1", companyId: COMPANY_A, title: "Title" }));
+    host.ctx.metrics.write.mockResolvedValue(undefined);
+    const requests: string[] = [];
+    const api = vi.fn(async (_url: string, init?: RequestInit) => {
+      requests.push(init?.method ?? "GET");
+      const current = { id: "interaction-1", kind, status: "pending", payload: { rejectRequiresReason } };
+      return { ok: true, json: async () => init?.method === "POST" ? { ...current, status: "accepted" } : [current] };
+    });
+    vi.stubGlobal("fetch", api);
+    host.ctx.http.fetch.mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    try {
+      await definition().setup(host.ctx);
+      await host.deliver(COMPANY_A, storedConfig({ paperclipApiKey: "fixture-only" }));
+      const parsedBody = { type: "block_actions", response_url: "https://hooks.slack.test/response", actions: [{ action_id: actionId, value: JSON.stringify({ issueId: "issue-1", interactionId: "interaction-1" }) }] };
+      const rawBody = JSON.stringify(parsedBody);
+      const timestamp = String(Math.floor(Date.now() / 1000));
+      const signature = "v0=" + createHmac("sha256", "signing-secret").update(`v0:${timestamp}:${rawBody}`).digest("hex");
+      await definition().onWebhook({ endpointKey: "slack-interactivity", rawBody, parsedBody, headers: { "x-slack-request-timestamp": timestamp, "x-slack-signature": signature } });
+      expect(requests).toEqual(canMutate ? ["GET", "POST"] : ["GET"]);
+      expect(JSON.stringify(host.ctx.http.fetch.mock.calls)).toContain("interaction_view_issue");
+    } finally { vi.unstubAllGlobals(); }
+  });
+});
