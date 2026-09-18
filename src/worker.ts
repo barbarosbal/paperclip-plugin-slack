@@ -52,6 +52,7 @@ import {
   BUILTIN_WATCH_TEMPLATES,
 } from "./proactive-suggestions.js";
 import { resolveStartupSlackToken, type SlackRuntimeHealth } from "./runtime-token.js";
+import { registerFounderAlerts } from "./founder-alerts.js";
 
 let pluginCtx: PluginContext;
 let pluginToken: string;
@@ -414,6 +415,11 @@ const plugin = definePlugin({
       return;
     }
     pluginToken = token;
+
+    registerFounderAlerts(ctx, {
+      getConfig,
+      token,
+    });
 
     // Resolve Slack signing secret for webhook signature verification
     if (config.slackSigningSecretRef) {

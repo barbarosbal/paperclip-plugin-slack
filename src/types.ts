@@ -18,6 +18,8 @@ export type SlackConfig = {
   escalationHoldMessage: string;
   paperclipBaseUrl: string;
   maxAgentsPerThread: number;
+  founderAlertsChannelId: string;
+  enableFounderAlerts: boolean;
 };
 
 // --- Session registry types ---

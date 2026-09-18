@@ -31,6 +31,7 @@ export const STATE_KEYS = {
   dailyAgentCosts: (date: string) => `daily-agent-costs-${date}`,
   firstRunNotified: (id: string) => `first-run-notified-${id}`,
   budgetAlert: (id: string, bucket: number) => `budget-alert-${id}-${bucket}`,
+  founderAlertDedup: (key: string) => `founder-alert-${key}`,
   watchRegistry: (ch: string, ts: string) => `watches_${ch}_${ts}`,
   commandRegistry: "custom-commands",
 } as const;
@@ -55,4 +56,6 @@ export const DEFAULT_CONFIG = {
   escalationHoldMessage: "Your request has been escalated to a human agent. Please hold.",
   paperclipBaseUrl: "http://localhost:3100",
   maxAgentsPerThread: 5,
+  founderAlertsChannelId: "",
+  enableFounderAlerts: false,
 } as const;

@@ -19,6 +19,7 @@ const manifest: PaperclipPluginManifestV1 = {
   categories: ["connector", "automation"],
   capabilities: [
     "companies.read",
+    "projects.read",
     "issues.read",
     "issues.create",
     "agents.read",
@@ -154,6 +155,20 @@ const manifest: PaperclipPluginManifestV1 = {
         title: "Max Agents Per Thread",
         description: "Maximum number of concurrent agents allowed in a single Slack thread.",
         default: DEFAULT_CONFIG.maxAgentsPerThread,
+      },
+      founderAlertsChannelId: {
+        type: "string",
+        title: "Founder Alerts Channel ID",
+        description:
+          "Outbound-only channel for founder-facing operational alerts (blocked, approvals, run errors, parent completion).",
+        default: DEFAULT_CONFIG.founderAlertsChannelId,
+      },
+      enableFounderAlerts: {
+        type: "boolean",
+        title: "Enable Founder Alerts",
+        description:
+          "When enabled, posts concise Turkish founder alerts to founderAlertsChannelId.",
+        default: DEFAULT_CONFIG.enableFounderAlerts,
       },
     },
     required: ["slackTokenRef", "slackSigningSecretRef", "defaultChannelId"],
