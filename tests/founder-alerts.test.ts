@@ -259,4 +259,51 @@ describe("registerFounderAlerts state dedup", () => {
 
     expect(postMessage).toHaveBeenCalledTimes(1);
   });
+
+  it("skips parent-complete when issue lookup fails (fail-closed)", async () => {
+    const { postMessage } = await import("../src/slack-api.js");
+    const { registerFounderAlerts } = await import("../src/founder-alerts.js");
+    vi.mocked(postMessage).mockClear();
+    vi.mocked(postMessage).mockResolvedValue({ ok: true, ts: "1" });
+
+    const handlers = new Map<string, (event: unknown) => Promise<void>>();
+
+    const ctx = {
+      state: {
+        async get() {
+          return null;
+        },
+        async set() {},
+      },
+      metrics: { async write() {} },
+      events: {
+        on(eventType: string, handler: (event: unknown) => Promise<void>) {
+          handlers.set(eventType, handler);
+        },
+      },
+      agents: { list: vi.fn().mockResolvedValue([]) },
+      projects: { get: vi.fn().mockResolvedValue(null) },
+      issues: {
+        get: vi.fn().mockRejectedValue(new Error("API unavailable")),
+      },
+    };
+
+    registerFounderAlerts(ctx as never, {
+      token: "token",
+      getConfig: async () =>
+        ({
+          enableFounderAlerts: true,
+          founderAlertsChannelId: "CFOUNDER",
+        }) as never,
+    });
+
+    const handler = handlers.get("issue.updated")!;
+    await handler({
+      companyId: "co-1",
+      entityId: "iss-missing",
+      payload: { status: "done", projectName: "Ratel Systems", agentName: "Hürkuş" },
+    });
+
+    expect(postMessage).not.toHaveBeenCalled();
+  });
 });
